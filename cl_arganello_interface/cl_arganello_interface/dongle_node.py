@@ -16,16 +16,16 @@ Pubs:
   alpine/dongle/telemetry/raw   (std_msgs/String): raw CSV lines (complete, de-chunked)
   alpine/dongle/telemetry       (std_msgs/Float32MultiArray): [epoch_ms, imu1[11], imu2[11]]
 
-
 Usage: 
 ros2 topic pub -1 /alpine/dongle/motorSpeed std_msgs/msg/Float32 "{data: 0.3}"
 ros2 topic pub -1 /alpine/dongle/servoValve1 std_msgs/msg/Float32 "{data: 45.0}"
 ros2 topic pub -1 /alpine/dongle/servoValve2 std_msgs/msg/Float32 "{data: 30.0}"
 
-
 """
 
 import re
+import threading
+import time
 from typing import List, Optional, Tuple
 
 import rclpy
@@ -38,8 +38,10 @@ import serial
 
 _RX_PREFIX = re.compile(r'^\[RX [0-9A-Fa-f:]{17}\]\s*')
 
+
 def _strip_prefix(line: str) -> str:
     return _RX_PREFIX.sub('', line).strip()
+
 
 def _split_flex_csv(s: str) -> List[str]:
     s = s.replace('\t', ',')
@@ -47,6 +49,7 @@ def _split_flex_csv(s: str) -> List[str]:
     if s.endswith(','):
         s = s[:-1]
     return [p for p in s.split(',') if p != '']
+
 
 def _parse_dual_imu(line: str) -> Optional[Tuple[int, List[float], List[float]]]:
     # Expect: epoch_ms,<11 imu1>,<11 imu2>
@@ -64,6 +67,7 @@ def _parse_dual_imu(line: str) -> Optional[Tuple[int, List[float], List[float]]]
     imu1 = vals[0:11]
     imu2 = vals[11:22]
     return epoch_ms, imu1, imu2
+
 
 class DongleNode(Node):
     def __init__(self):
@@ -89,9 +93,16 @@ class DongleNode(Node):
         self.create_subscription(Float32, 'alpine/dongle/servoValve1', self._cb_s1, qos)
         self.create_subscription(Float32, 'alpine/dongle/servoValve2', self._cb_s2, qos)
 
-        # Serial (buffered, non-blocking reads)
+        # Serial
         self.ser = None
         self._buf = bytearray()
+        self._ser_lock = threading.Lock()
+        self._last_open_attempt = 0.0
+
+        # Optional tiny de-bounce for repeated identical commands
+        self._last_tx = {}
+        self._min_repeat_dt = 0.01  # 10 ms
+
         self._open_serial()
 
         # Polling timer
@@ -103,22 +114,56 @@ class DongleNode(Node):
 
     # --- Serial helpers -----------------------------------------------------
     def _open_serial(self):
+        now = time.monotonic()
+        if now - self._last_open_attempt < 0.5:
+            return
+        self._last_open_attempt = now
+
         try:
-            # small timeout so .read() returns quickly but allows aggregation
-            self.ser = serial.Serial(self.serial_port, self.baud, timeout=0.01)
+            with self._ser_lock:
+                self.ser = serial.Serial(
+                    self.serial_port,
+                    self.baud,
+                    timeout=0.01,
+                    write_timeout=0.01,
+                    exclusive=False,
+                )
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                self._buf.clear()
             self.get_logger().info(f"Opened serial: {self.serial_port} @ {self.baud}")
         except Exception as e:
             self.get_logger().error(f"Serial open failed: {e}")
             self.ser = None
 
+    def _close_serial(self):
+        try:
+            with self._ser_lock:
+                if self.ser is not None:
+                    self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+
     def _send_line(self, text: str):
         if not text.endswith('\n'):
             text += '\n'
+
+        now = time.monotonic()
+        prev = self._last_tx.get(text)
+        if prev is not None and (now - prev) < self._min_repeat_dt:
+            return
+        self._last_tx[text] = now
+
         try:
-            if self.ser is not None and self.ser.is_open:
-                self.ser.write(text.encode('utf-8', errors='ignore'))
+            with self._ser_lock:
+                if self.ser is not None and self.ser.is_open:
+                    self.ser.write(text.encode('utf-8', errors='ignore'))
+                else:
+                    self.get_logger().warn("Serial not open, dropping command")
         except Exception as e:
             self.get_logger().warn(f"Serial write error: {e}")
+            self._close_serial()
 
     # --- Subscribers --------------------------------------------------------
     def _cb_motor(self, msg: Float32):
@@ -137,18 +182,25 @@ class DongleNode(Node):
             return
 
         try:
-            # read any available bytes (chunked)
-            chunk = self.ser.read(1024)
+            with self._ser_lock:
+                chunk = self.ser.read(1024)
+
             if chunk:
                 self._buf.extend(chunk)
 
-            # extract complete lines ending with '\n'
+            # guard against partial junk with no newline forever
+            if len(self._buf) > 8192:
+                self.get_logger().warn("RX buffer overflow guard: clearing partial buffer")
+                self._buf.clear()
+
             while True:
                 nl = self._buf.find(b'\n')
                 if nl < 0:
                     break
-                line_bytes = self._buf[:nl+1]
-                del self._buf[:nl+1]
+
+                line_bytes = self._buf[:nl + 1]
+                del self._buf[:nl + 1]
+
                 line = line_bytes.decode(errors='ignore').strip()
                 if not line:
                     continue
@@ -160,7 +212,7 @@ class DongleNode(Node):
                 parsed = _parse_dual_imu(line)
                 if parsed is not None:
                     epoch_ms, imu1, imu2 = parsed
-                    data = [float(epoch_ms)] + (imu1 + [0.0]*11)[:11] + (imu2 + [0.0]*11)[:11]
+                    data = [float(epoch_ms)] + (imu1 + [0.0] * 11)[:11] + (imu2 + [0.0] * 11)[:11]
                     layout = MultiArrayLayout(
                         dim=[MultiArrayDimension(label='fields', size=len(data), stride=len(data))],
                         data_offset=0
@@ -169,12 +221,8 @@ class DongleNode(Node):
 
         except Exception as e:
             self.get_logger().warn(f"Serial read error: {e}")
-            try:
-                if self.ser:
-                    self.ser.close()
-            except Exception:
-                pass
-            self.ser = None  # retry next tick
+            self._close_serial()
+
 
 def main():
     rclpy.init()
@@ -186,6 +234,7 @@ def main():
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
