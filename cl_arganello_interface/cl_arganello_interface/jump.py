@@ -213,137 +213,482 @@ if __name__ == '__main__':
 # if __name__ == '__main__':
 #     main()
 
+
+
+
+#2 test
+
+#import rclpy
+#from rclpy.node import Node
+#from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+#from rclpy.executors import MultiThreadedExecutor
+#from std_srvs.srv import Trigger
+#from std_msgs.msg import Float32
+#from cl_arganello_interface.msg import RopeCommand
+#
+#MS = 1.0  # readability
+#
+#class JumpNode(Node):
+#    def __init__(self):
+#         super().__init__('jump_node')
+
+#         # ── Publishers ──────────────────────────────────────────────
+#         self.pub_s1 = self.create_publisher(Float32, '/alpine/dongle/servoValve1', 10) 
+#         self.pub_s2 = self.create_publisher(Float32, '/alpine/dongle/servoValve2', 10) 
+#         self.pub_left  = self.create_publisher(RopeCommand, '/winch/left/command', 10) 
+#         self.pub_right = self.create_publisher(RopeCommand, '/winch/right/command',10) 
+
+#         # ── Timer: 1 ms state machine (non-blocking) ───────────────
+#         # Cheap work per tick; we only check deadlines and publish if due.
+#         self.timer = self.create_timer(0.001, self.tick)  # 1 kHz
+
+#         # ── Jump sequence state ─────────────────────────────────────
+#         self.sequence_running = False
+#         self.sequence_start_ms = 0.0
+#         self.pending_motor_deadline_ms = None  # set when we publish valves
+
+#         self.up_force = 18.0
+#         self.down_force = 6.0
+#         self.hold_force = 10.0
+#         # Sequence: (duration_ms, left_force, right_force, s1, s2)
+#         self.sequence = [
+            
+            
+#             (200,  -self.up_force,  self.up_force,   90.0, 0.0),   # Phase 1 salto
+#             (5,   -self.up_force,  self.up_force,   0.0,  0.0),   # Phase 2 volo
+#             (1200,  -self.up_force,  self.up_force,   0.0,  90.0),   # Phase 3 atterraggio
+            
+#             (3000,  -self.hold_force,  self.hold_force,   0.0,  0.0),   # Phase 4 fermo
+            
+            
+#             (200,  -self.down_force,  self.down_force,   90.0, 0.0),   # Phase 1 salto
+#             (5,   -self.down_force,  self.down_force,   0.0,  0.0),   # Phase 2 volo
+#             (1600,  -self.down_force,  self.down_force,   0.0,  90.0),   # Phase 3 atterraggio
+            
+#             (1000,  -self.hold_force,  self.hold_force,   0.0,  0.0),   # Phase 4 fermo
+            
+#             (1000,  -self.hold_force,  self.hold_force,   0.0,  90.0),   # Phase 3 reset
+#             (1000,  -self.hold_force,  self.hold_force,   0.0,  0.0),   # Phase 4 fermo
+            
+#         ]
+
+#         # Precompute cumulative timeline in ms
+#         self.timeline = []
+#         acc = 0
+#         for dur, lf, rf, s1, s2 in self.sequence:
+#             acc += dur
+#             self.timeline.append((acc, lf, rf, s1, s2))
+
+#         # Service to trigger jump
+#         self.create_service(Trigger, '/alpine/jump', self.handle_jump)
+
+#         self.get_logger().info("jump_node started (1 kHz state machine, no blocking sleeps)")
+
+#         # Idle defaults
+#         self.idle_lf = -self.hold_force
+#         self.idle_rf =  self.hold_force
+#         self.idle_s1 =  0.0
+#         self.idle_s2 =  0.0
+
+#     # Monotonic ms helper
+#     def now_ms(self) -> float:
+#         return self.get_clock().now().nanoseconds / 1e6
+
+#     # Non-blocking: publish valves immediately, schedule motors for t+500 ms
+#     def publish_valves_then_motors(self, lf: float, rf: float, s1: float, s2: float):
+#         # 1) Valves now
+#         self.pub_s1.publish(Float32(data=s1))
+#         self.pub_s2.publish(Float32(data=s2))
+
+#         # 2) Schedule motors at +500 ms (no sleep)
+#         self.pending_motor_deadline_ms = self.now_ms() + 500.0
+
+#         # Stash pending motor values
+#         self.pending_lf = lf
+#         self.pending_rf = rf
+
+#     # Called at 1 kHz; do tiny work each tick
+#     def tick(self):
+#         t_ms = self.now_ms()
+
+#         # If we have a scheduled motor publish, fire it when due
+#         if self.pending_motor_deadline_ms is not None and t_ms >= self.pending_motor_deadline_ms:
+#             rope_left  = RopeCommand(rope_force=self.pending_lf, rope_velocity=0.0, rope_position=0.0)
+#             rope_right = RopeCommand(rope_force=self.pending_rf, rope_velocity=0.0, rope_position=0.0)
+#             self.pub_left.publish(rope_left)
+#             self.pub_right.publish(rope_right)
+#             self.pending_motor_deadline_ms = None  # clear
+
+#         # Idle mode
+#         if not self.sequence_running:
+#             # Keep outputs refreshed but lightweight
+#             # Only issue commands if we don’t have a pending motor publish
+#             if self.pending_motor_deadline_ms is None:
+#                 self.publish_valves_then_motors(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
+#             return
+
+#         # Sequence mode: compute current step from elapsed
+#         elapsed_ms = t_ms - self.sequence_start_ms
+
+#         # defaults if beyond end
+#         lf, rf, s1, s2 = self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2
+
+#         for limit_ms, lf_v, rf_v, s1_v, s2_v in self.timeline:
+#             if elapsed_ms < limit_ms:
+#                 lf, rf, s1, s2 = lf_v, rf_v, s1_v, s2_v
+#                 break
+#         else:
+#             self.sequence_running = False
+#             self.get_logger().info("Jump sequence completed")
+
+#         # Only schedule a new pair if no motor publish is pending (keeps ordering)
+#         if self.pending_motor_deadline_ms is None:
+#             self.publish_valves_then_motors(lf, rf, s1, s2)
+
+#     def handle_jump(self, request, response):
+#         self.sequence_running = True
+#         self.sequence_start_ms = self.now_ms()
+#         self.pending_motor_deadline_ms = None  # reset any pending
+#         self.get_logger().info("Jump sequence triggered")
+#         response.success = True
+#         response.message = "Jump sequence started"
+#         return response
+
+
+# def main(args=None):
+#     rclpy.init(args=args)
+#     node = JumpNode()
+
+#     # Multi-threaded executor so timers & services don’t block each other
+#     executor = MultiThreadedExecutor(num_threads=2)
+#     executor.add_node(node)
+#     try:
+#         executor.spin()
+#     except KeyboardInterrupt:
+#         pass
+#     finally:
+#         executor.shutdown()
+#         node.destroy_node()
+#         rclpy.shutdown()
+
+
+# if __name__ == '__main__':
+#     main()
+
+#1version
+
+# import rclpy
+# from rclpy.node import Node
+# from rclpy.executors import MultiThreadedExecutor
+# from std_srvs.srv import Trigger
+# from std_msgs.msg import Float32
+# from cl_arganello_interface.msg import RopeCommand
+
+
+# class JumpNode(Node):
+#     def __init__(self):
+#         super().__init__('jump_node')
+
+#         # Publishers
+#         self.pub_s1 = self.create_publisher(Float32, '/alpine/dongle/servoValve1', 10)
+#         self.pub_s2 = self.create_publisher(Float32, '/alpine/dongle/servoValve2', 10)
+#         self.pub_left = self.create_publisher(RopeCommand, '/winch/left/command', 10)
+#         self.pub_right = self.create_publisher(RopeCommand, '/winch/right/command', 10)
+
+#         # 100 Hz state machine
+#         self.timer = self.create_timer(0.01, self.tick)
+
+#         # Trigger service
+#         self.create_service(Trigger, '/alpine/jump', self.handle_jump)
+
+#         # Tuning
+#         self.up_force = 18.0
+#         self.down_force = 6.0
+#         self.hold_force = 10.0
+
+#         # Sequence: (duration_ms, left_force, right_force, s1, s2)
+#         # Keep phases >= 20 ms; 30–50 ms is healthier than 5 ms for your comm stack.
+#         self.sequence = [
+#             (220,  -self.up_force,   self.up_force,   90.0,  0.0),   # jump impulse
+#             (30,   -self.up_force,   self.up_force,    0.0,  0.0),   # short flight gap
+#             (900,  -self.up_force,   self.up_force,    0.0, 90.0),   # landing / exhaust
+#             (600,  -self.hold_force, self.hold_force,  0.0,  0.0),   # hold
+
+#             (220,  -self.down_force, self.down_force, 90.0,  0.0),   # jump impulse 2
+#             (30,   -self.down_force, self.down_force,  0.0,  0.0),   # short flight gap
+#             (1200, -self.down_force, self.down_force,  0.0, 90.0),   # landing / exhaust
+#             (800,  -self.hold_force, self.hold_force,  0.0,  0.0),   # final hold
+#         ]
+
+#         # Precompute cumulative timeline
+#         self.timeline = []
+#         acc = 0.0
+#         for dur, lf, rf, s1, s2 in self.sequence:
+#             acc += float(dur)
+#             self.timeline.append((acc, lf, rf, s1, s2))
+
+#         # State
+#         self.sequence_running = False
+#         self.sequence_start_ms = 0.0
+#         self.current_phase_index = -1
+
+#         # Idle
+#         self.idle_lf = -self.hold_force
+#         self.idle_rf = self.hold_force
+#         self.idle_s1 = 0.0
+#         self.idle_s2 = 0.0
+
+#         # Last sent command tuple
+#         self.last_sent = None
+
+#         # Refresh counters
+#         self.idle_refresh_div = 0
+#         self.phase_refresh_div = 0
+
+#         self.get_logger().info("jump_node started (100 Hz, no blocking sleeps, no fake 500 ms delay)")
+
+#     def now_ms(self) -> float:
+#         return self.get_clock().now().nanoseconds / 1e6
+
+#     def publish_all(self, lf: float, rf: float, s1: float, s2: float):
+#         self.pub_s1.publish(Float32(data=float(s1)))
+#         self.pub_s2.publish(Float32(data=float(s2)))
+
+#         left = RopeCommand(rope_force=float(lf), rope_velocity=0.0, rope_position=0.0)
+#         right = RopeCommand(rope_force=float(rf), rope_velocity=0.0, rope_position=0.0)
+#         self.pub_left.publish(left)
+#         self.pub_right.publish(right)
+
+#     def send_if_changed(self, lf: float, rf: float, s1: float, s2: float):
+#         cmd = (round(lf, 3), round(rf, 3), round(s1, 3), round(s2, 3))
+#         if cmd != self.last_sent:
+#             self.publish_all(lf, rf, s1, s2)
+#             self.last_sent = cmd
+
+#     def refresh_current(self, lf: float, rf: float, s1: float, s2: float):
+#         # Periodic refresh of the same command for robustness, but not every tick
+#         self.publish_all(lf, rf, s1, s2)
+
+#     def tick(self):
+#         if not self.sequence_running:
+#             # In idle, refresh only every 200 ms so we do not fight manual commands too hard.
+#             self.idle_refresh_div += 1
+#             if self.idle_refresh_div >= 20:
+#                 self.idle_refresh_div = 0
+#                 self.send_if_changed(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
+#             return
+
+#         elapsed_ms = self.now_ms() - self.sequence_start_ms
+
+#         phase_index = None
+#         lf, rf, s1, s2 = self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2
+
+#         for i, (limit_ms, lf_v, rf_v, s1_v, s2_v) in enumerate(self.timeline):
+#             if elapsed_ms < limit_ms:
+#                 phase_index = i
+#                 lf, rf, s1, s2 = lf_v, rf_v, s1_v, s2_v
+#                 break
+
+#         if phase_index is None:
+#             self.sequence_running = False
+#             self.current_phase_index = -1
+#             self.phase_refresh_div = 0
+#             self.get_logger().info("Jump sequence completed")
+#             self.send_if_changed(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
+#             return
+
+#         if phase_index != self.current_phase_index:
+#             self.current_phase_index = phase_index
+#             self.phase_refresh_div = 0
+#             self.get_logger().info(
+#                 f"Phase {phase_index+1}/{len(self.timeline)} -> "
+#                 f"lf={lf:.1f}, rf={rf:.1f}, s1={s1:.1f}, s2={s2:.1f}"
+#             )
+#             # Send immediately on phase change
+#             self.send_if_changed(lf, rf, s1, s2)
+#             return
+
+#         # Refresh current phase command every 30 ms (every 3 ticks at 100 Hz)
+#         self.phase_refresh_div += 1
+#         if self.phase_refresh_div >= 3:
+#             self.phase_refresh_div = 0
+#             self.refresh_current(lf, rf, s1, s2)
+
+#     def handle_jump(self, request, response):
+#         self.sequence_running = True
+#         self.sequence_start_ms = self.now_ms()
+#         self.current_phase_index = -1
+#         self.phase_refresh_div = 0
+#         self.last_sent = None
+#         self.get_logger().info("Jump sequence triggered")
+#         response.success = True
+#         response.message = "Jump sequence started"
+#         return response
+
+
+# def main(args=None):
+#     rclpy.init(args=args)
+#     node = JumpNode()
+#     executor = MultiThreadedExecutor(num_threads=2)
+#     executor.add_node(node)
+#     try:
+#         executor.spin()
+#     except KeyboardInterrupt:
+#         pass
+#     finally:
+#         executor.shutdown()
+#         node.destroy_node()
+#         rclpy.shutdown()
+
+
+# if __name__ == '__main__':
+#     main()
+
+
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from std_srvs.srv import Trigger
 from std_msgs.msg import Float32
 from cl_arganello_interface.msg import RopeCommand
 
-MS = 1.0  # readability
 
 class JumpNode(Node):
     def __init__(self):
         super().__init__('jump_node')
 
-        # ── Publishers ──────────────────────────────────────────────
-        self.pub_s1 = self.create_publisher(Float32, '/alpine/dongle/servoValve1', 10) 
-        self.pub_s2 = self.create_publisher(Float32, '/alpine/dongle/servoValve2', 10) 
-        self.pub_left  = self.create_publisher(RopeCommand, '/winch/left/command', 10) 
-        self.pub_right = self.create_publisher(RopeCommand, '/winch/right/command',10) 
+        # Publishers
+        self.pub_s1 = self.create_publisher(Float32, '/alpine/dongle/servoValve1', 10)
+        self.pub_s2 = self.create_publisher(Float32, '/alpine/dongle/servoValve2', 10)
+        self.pub_left = self.create_publisher(RopeCommand, '/winch/left/command', 10)
+        self.pub_right = self.create_publisher(RopeCommand, '/winch/right/command', 10)
 
-        # ── Timer: 1 ms state machine (non-blocking) ───────────────
-        # Cheap work per tick; we only check deadlines and publish if due.
-        self.timer = self.create_timer(0.001, self.tick)  # 1 kHz
+        # 100 Hz state machine
+        self.timer = self.create_timer(0.01, self.tick)
 
-        # ── Jump sequence state ─────────────────────────────────────
-        self.sequence_running = False
-        self.sequence_start_ms = 0.0
-        self.pending_motor_deadline_ms = None  # set when we publish valves
+        # Trigger service
+        self.create_service(Trigger, '/alpine/jump', self.handle_jump)
 
+        # Tuning
         self.up_force = 18.0
         self.down_force = 6.0
         self.hold_force = 10.0
+
         # Sequence: (duration_ms, left_force, right_force, s1, s2)
+        # Keep phases >= 20 ms; 30–50 ms is healthier than 5 ms for your comm stack.
         self.sequence = [
-            
-            
-            (200,  -self.up_force,  self.up_force,   90.0, 0.0),   # Phase 1 salto
-            (5,   -self.up_force,  self.up_force,   0.0,  0.0),   # Phase 2 volo
-            (1200,  -self.up_force,  self.up_force,   0.0,  90.0),   # Phase 3 atterraggio
-            
-            (3000,  -self.hold_force,  self.hold_force,   0.0,  0.0),   # Phase 4 fermo
-            
-            
-            (200,  -self.down_force,  self.down_force,   90.0, 0.0),   # Phase 1 salto
-            (5,   -self.down_force,  self.down_force,   0.0,  0.0),   # Phase 2 volo
-            (1600,  -self.down_force,  self.down_force,   0.0,  90.0),   # Phase 3 atterraggio
-            
-            (1000,  -self.hold_force,  self.hold_force,   0.0,  0.0),   # Phase 4 fermo
-            
-            (1000,  -self.hold_force,  self.hold_force,   0.0,  90.0),   # Phase 3 reset
-            (1000,  -self.hold_force,  self.hold_force,   0.0,  0.0),   # Phase 4 fermo
-            
+            (220,  -self.up_force,   self.up_force,   90.0,  0.0),   # jump impulse
+            (30,   -self.up_force,   self.up_force,    0.0,  0.0),   # short flight gap
+            (900,  -self.up_force,   self.up_force,    0.0, 90.0),   # landing / exhaust
+            (600,  -self.hold_force, self.hold_force,  0.0,  0.0),   # hold
+
+            (220,  -self.down_force, self.down_force, 90.0,  0.0),   # jump impulse 2
+            (30,   -self.down_force, self.down_force,  0.0,  0.0),   # short flight gap
+            (1200, -self.down_force, self.down_force,  0.0, 90.0),   # landing / exhaust
+            (800,  -self.hold_force, self.hold_force,  0.0,  0.0),   # final hold
         ]
 
-        # Precompute cumulative timeline in ms
+        # Precompute cumulative timeline
         self.timeline = []
-        acc = 0
+        acc = 0.0
         for dur, lf, rf, s1, s2 in self.sequence:
-            acc += dur
+            acc += float(dur)
             self.timeline.append((acc, lf, rf, s1, s2))
 
-        # Service to trigger jump
-        self.create_service(Trigger, '/alpine/jump', self.handle_jump)
+        # State
+        self.sequence_running = False
+        self.sequence_start_ms = 0.0
+        self.current_phase_index = -1
 
-        self.get_logger().info("jump_node started (1 kHz state machine, no blocking sleeps)")
-
-        # Idle defaults
+        # Idle
         self.idle_lf = -self.hold_force
-        self.idle_rf =  self.hold_force
-        self.idle_s1 =  0.0
-        self.idle_s2 =  0.0
+        self.idle_rf = self.hold_force
+        self.idle_s1 = 0.0
+        self.idle_s2 = 0.0
 
-    # Monotonic ms helper
+        # Last sent command tuple
+        self.last_sent = None
+
+        # Refresh counters
+        self.idle_refresh_div = 0
+        self.phase_refresh_div = 0
+
+        self.get_logger().info("jump_node started (100 Hz, no blocking sleeps, no fake 500 ms delay)")
+
     def now_ms(self) -> float:
         return self.get_clock().now().nanoseconds / 1e6
 
-    # Non-blocking: publish valves immediately, schedule motors for t+500 ms
-    def publish_valves_then_motors(self, lf: float, rf: float, s1: float, s2: float):
-        # 1) Valves now
-        self.pub_s1.publish(Float32(data=s1))
-        self.pub_s2.publish(Float32(data=s2))
+    def publish_all(self, lf: float, rf: float, s1: float, s2: float):
+        self.pub_s1.publish(Float32(data=float(s1)))
+        self.pub_s2.publish(Float32(data=float(s2)))
 
-        # 2) Schedule motors at +500 ms (no sleep)
-        self.pending_motor_deadline_ms = self.now_ms() + 500.0
+        left = RopeCommand(rope_force=float(lf), rope_velocity=0.0, rope_position=0.0)
+        right = RopeCommand(rope_force=float(rf), rope_velocity=0.0, rope_position=0.0)
+        self.pub_left.publish(left)
+        self.pub_right.publish(right)
 
-        # Stash pending motor values
-        self.pending_lf = lf
-        self.pending_rf = rf
+    def send_if_changed(self, lf: float, rf: float, s1: float, s2: float):
+        cmd = (round(lf, 3), round(rf, 3), round(s1, 3), round(s2, 3))
+        if cmd != self.last_sent:
+            self.publish_all(lf, rf, s1, s2)
+            self.last_sent = cmd
 
-    # Called at 1 kHz; do tiny work each tick
+    def refresh_current(self, lf: float, rf: float, s1: float, s2: float):
+        # Periodic refresh of the same command for robustness, but not every tick
+        self.publish_all(lf, rf, s1, s2)
+
     def tick(self):
-        t_ms = self.now_ms()
-
-        # If we have a scheduled motor publish, fire it when due
-        if self.pending_motor_deadline_ms is not None and t_ms >= self.pending_motor_deadline_ms:
-            rope_left  = RopeCommand(rope_force=self.pending_lf, rope_velocity=0.0, rope_position=0.0)
-            rope_right = RopeCommand(rope_force=self.pending_rf, rope_velocity=0.0, rope_position=0.0)
-            self.pub_left.publish(rope_left)
-            self.pub_right.publish(rope_right)
-            self.pending_motor_deadline_ms = None  # clear
-
-        # Idle mode
         if not self.sequence_running:
-            # Keep outputs refreshed but lightweight
-            # Only issue commands if we don’t have a pending motor publish
-            if self.pending_motor_deadline_ms is None:
-                self.publish_valves_then_motors(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
+            # In idle, refresh only every 200 ms so we do not fight manual commands too hard.
+            self.idle_refresh_div += 1
+            if self.idle_refresh_div >= 20:
+                self.idle_refresh_div = 0
+                self.send_if_changed(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
             return
 
-        # Sequence mode: compute current step from elapsed
-        elapsed_ms = t_ms - self.sequence_start_ms
+        elapsed_ms = self.now_ms() - self.sequence_start_ms
 
-        # defaults if beyond end
+        phase_index = None
         lf, rf, s1, s2 = self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2
 
-        for limit_ms, lf_v, rf_v, s1_v, s2_v in self.timeline:
+        for i, (limit_ms, lf_v, rf_v, s1_v, s2_v) in enumerate(self.timeline):
             if elapsed_ms < limit_ms:
+                phase_index = i
                 lf, rf, s1, s2 = lf_v, rf_v, s1_v, s2_v
                 break
-        else:
-            self.sequence_running = False
-            self.get_logger().info("Jump sequence completed")
 
-        # Only schedule a new pair if no motor publish is pending (keeps ordering)
-        if self.pending_motor_deadline_ms is None:
-            self.publish_valves_then_motors(lf, rf, s1, s2)
+        if phase_index is None:
+            self.sequence_running = False
+            self.current_phase_index = -1
+            self.phase_refresh_div = 0
+            self.get_logger().info("Jump sequence completed")
+            self.send_if_changed(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
+            return
+
+        if phase_index != self.current_phase_index:
+            self.current_phase_index = phase_index
+            self.phase_refresh_div = 0
+            self.get_logger().info(
+                f"Phase {phase_index+1}/{len(self.timeline)} -> "
+                f"lf={lf:.1f}, rf={rf:.1f}, s1={s1:.1f}, s2={s2:.1f}"
+            )
+            # Send immediately on phase change
+            self.send_if_changed(lf, rf, s1, s2)
+            return
+
+        # Refresh current phase command every 30 ms (every 3 ticks at 100 Hz)
+        self.phase_refresh_div += 1
+        if self.phase_refresh_div >= 3:
+            self.phase_refresh_div = 0
+            self.refresh_current(lf, rf, s1, s2)
 
     def handle_jump(self, request, response):
         self.sequence_running = True
         self.sequence_start_ms = self.now_ms()
-        self.pending_motor_deadline_ms = None  # reset any pending
+        self.current_phase_index = -1
+        self.phase_refresh_div = 0
+        self.last_sent = None
         self.get_logger().info("Jump sequence triggered")
         response.success = True
         response.message = "Jump sequence started"
@@ -353,8 +698,6 @@ class JumpNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = JumpNode()
-
-    # Multi-threaded executor so timers & services don’t block each other
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
