@@ -31,6 +31,9 @@ install(
     cl_arganello_interface/friction_estimator.py
     cl_arganello_interface/telemetry_node.py
     cl_arganello_interface/jump.py
+    cl_arganello_interface/alpine_odometry_node.py
+    cl_arganello_interface/position_step_test.py
+    cl_arganello_interface/position_control_logger.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

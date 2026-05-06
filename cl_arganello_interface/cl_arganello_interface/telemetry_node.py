@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import json
 import math
 import time
@@ -8,27 +9,39 @@ import csv
 from pathlib import Path
 from typing import Optional, List, Dict
 from collections import deque
-from typing import Union
+
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
+
 from cl_arganello_interface.msg import RopeCommand
 from cl_arganello_interface.msg import DebugMessage
 from cl_arganello_interface.msg import RopeTelemetry
 
 
-
 class TelemetryNode(Node):
     """
     Reads CSV telemetry from MCU, republishes raw lines, computes robust velocities:
-      - fixed dt from poll_rate_hz (no reliance on CSV time for derivatives)
-      - unwrap motor (0..1) → rev, roller (0..CPR-1) → counts
-      - LPF on unwrapped positions (NOT on velocity)
-      - windowed derivative across k samples
-      - outlier hold, brake gating, rope-speed sanity clamp
-    """
+      - fixed dt from poll_rate_hz
+      - unwrap motor (0..1) -> rev
+      - unwrap roller (0..CPR-1) -> counts
+      - LPF on unwrapped positions
+      - windowed derivative
+      - outlier hold
+      - brake gating
+      - rope-speed sanity clamp
 
+    Rope conversions:
+      r_eff = sync_roller_radius_m + rope_diameter_m / 2
+
+      rope_velocity = omega_roller * r_eff
+
+      G = omega_roller / omega_motor
+
+      tau_motor = F_rope * G * r_eff
+      F_rope = tau_motor / (G * r_eff)
+    """
 
     def __init__(self):
         super().__init__("telemetry_node")
@@ -38,7 +51,7 @@ class TelemetryNode(Node):
         self.declare_parameter("baud", 1_000_000)
         self.declare_parameter("poll_rate_hz", 200.0)
 
-        self.declare_parameter("side", "left")  # "left" | "right"
+        self.declare_parameter("side", "left")
         self.declare_parameter(
             "config_path",
             str(Path(__file__).resolve().parent.parent / "config" / "arganelloTelemetry.json"),
@@ -49,24 +62,42 @@ class TelemetryNode(Node):
 
         # Sync behavior
         self.declare_parameter("send_sync_on_start", True)
-        self.declare_parameter("resync_interval_s", 0.0)  # 0 => disabled
-        self.declare_parameter("sync_epoch_unit", "ms")   # "ms" (recommended) or "ns"
+        self.declare_parameter("resync_interval_s", 0.0)
+        self.declare_parameter("sync_epoch_unit", "ms")
         self.declare_parameter("append_pc_time_ns", False)
 
-        # Geometry/config (override at launch if needed)
-        self.declare_parameter("sync_roller_radius_m", 0.025)  # meters (← set your real radius)
+        # Geometry/config
+        self.declare_parameter("sync_roller_radius_m", 0.025)
         self.declare_parameter("sync_roller_cpr", 2400)
+        self.declare_parameter("rope_diameter_m", 0.005)
+        self.declare_parameter("rope_position_calibration", 17.0)
+        # Rope position control implemented as an outer loop on measured rope_length.
+        # This keeps the external interface compatible with closed_loop_position / rope_position
+        # while using the ODrive as inner velocity controller.
+        self.declare_parameter("rope_position_outer_loop_enabled", True)
+        self.declare_parameter("rope_position_kp", 1.0)
+        self.declare_parameter("rope_position_max_vel_m_s", 0.01)
+        self.declare_parameter("rope_position_deadband_m", 0.0005)
 
-        # Limits & filters (override at launch if needed)
+        # Limits & filters
         self.declare_parameter("max_motor_rps", 20.0)
         self.declare_parameter("max_roller_rps", 20.0)
         self.declare_parameter("count_deadband", 2)
-        self.declare_parameter("lpf_fc_pos_motor", 5.0)     # Hz, on motor position
-        self.declare_parameter("lpf_fc_pos_roller", 5.0)    # Hz, on roller counts
-        self.declare_parameter("brake_zero_rps", 0.2)       # ~12 rpm threshold
+        self.declare_parameter("lpf_fc_pos_motor", 5.0)
+        self.declare_parameter("lpf_fc_pos_roller", 5.0)
+        self.declare_parameter("brake_zero_rps", 0.2)
         self.declare_parameter("phys_max_rope_m_s", 5.0)
-        self.declare_parameter("rope_diameter_m", 0.005)   # 5 mm by request
 
+        # Variable gear ratio estimator
+        self.declare_parameter("gear_ratio_nominal", 2.31)
+        self.declare_parameter("gear_ratio_update_enabled", True)
+        self.declare_parameter("gear_ratio_min", 0.5)
+        self.declare_parameter("gear_ratio_max", 6.0)
+        self.declare_parameter("gear_ratio_alpha", 0.02)
+        self.declare_parameter("gear_ratio_motor_eps", 0.20)
+        self.declare_parameter("gear_ratio_roller_eps", 0.05)
+        self.declare_parameter("gear_ratio_max_step", 0.15)
+        self.declare_parameter("gear_ratio_log_period", 200)
 
         # ── Read params ────────────────────────────────────────────────────────
         self.port = self.get_parameter("serial_port").value
@@ -88,6 +119,20 @@ class TelemetryNode(Node):
 
         self.sync_roller_radius_m = float(self.get_parameter("sync_roller_radius_m").value)
         self.sync_roller_cpr = int(self.get_parameter("sync_roller_cpr").value)
+        self.rope_diameter_m = float(self.get_parameter("rope_diameter_m").value)
+        self.rope_position_calibration = float(
+            self.get_parameter("rope_position_calibration").value
+        )
+        self.rope_position_outer_loop_enabled = bool(
+            self.get_parameter("rope_position_outer_loop_enabled").value
+        )
+        self.rope_position_kp = float(self.get_parameter("rope_position_kp").value)
+        self.rope_position_max_vel_m_s = float(
+            self.get_parameter("rope_position_max_vel_m_s").value
+        )
+        self.rope_position_deadband_m = float(
+            self.get_parameter("rope_position_deadband_m").value
+        )
 
         self.max_motor_rps = float(self.get_parameter("max_motor_rps").value)
         self.max_roller_rps = float(self.get_parameter("max_roller_rps").value)
@@ -96,9 +141,17 @@ class TelemetryNode(Node):
         self.lpf_fc_pos_roller = float(self.get_parameter("lpf_fc_pos_roller").value)
         self.brake_zero_rps = float(self.get_parameter("brake_zero_rps").value)
         self.phys_max_rope_m_s = float(self.get_parameter("phys_max_rope_m_s").value)
-        self.rope_diameter_m = float(self.get_parameter("rope_diameter_m").value)
-        
 
+        # Variable gear ratio estimator params
+        self.gear_ratio_nominal = float(self.get_parameter("gear_ratio_nominal").value)
+        self.gear_ratio_update_enabled = bool(self.get_parameter("gear_ratio_update_enabled").value)
+        self.gear_ratio_min = float(self.get_parameter("gear_ratio_min").value)
+        self.gear_ratio_max = float(self.get_parameter("gear_ratio_max").value)
+        self.gear_ratio_alpha = float(self.get_parameter("gear_ratio_alpha").value)
+        self.gear_ratio_motor_eps = float(self.get_parameter("gear_ratio_motor_eps").value)
+        self.gear_ratio_roller_eps = float(self.get_parameter("gear_ratio_roller_eps").value)
+        self.gear_ratio_max_step = float(self.get_parameter("gear_ratio_max_step").value)
+        self.gear_ratio_log_period = int(self.get_parameter("gear_ratio_log_period").value)
 
         # ── Serial ─────────────────────────────────────────────────────────────
         try:
@@ -109,17 +162,12 @@ class TelemetryNode(Node):
             self.get_logger().fatal(f"❌ Failed to open serial: {e}")
             raise
 
-        # --- Sticky “last valid” holders (init before threads start)
-        self._last_valid_motor_pos_norm: float | None = None
-
-        self._motor_rev_zero = None
-
-
-
-        # ── Pubs/Subs/Services (namespaced by side) ───────────────────────────
+        # ── Pubs/Subs/Services ────────────────────────────────────────────────
         base = f"/winch/{self.side}"
+
         self.pub_csv = self.create_publisher(String, f"{base}/telemetry/csv", 10)
         self.pub_debug = self.create_publisher(DebugMessage, f"{base}/telemetry/debug", 10)
+        self.pub_rope = self.create_publisher(RopeTelemetry, f"{base}/telemetry", 10)
 
         self.create_subscription(String, f"{base}/set_motor_mode", self._set_motor_mode_cb, 10)
         self.create_subscription(RopeCommand, f"{base}/command", self._rope_command_cb, 10)
@@ -129,33 +177,59 @@ class TelemetryNode(Node):
         self.create_service(Trigger, f"{base}/sync_now", self._srv_sync_now)
         self.create_service(Trigger, f"{base}/rope_zero", self._srv_rope_zero)
 
-
-        self.pub_rope = self.create_publisher(RopeTelemetry, f"{base}/telemetry", 10)
-
-
-
         # ── TX queue & CSV header tracking ────────────────────────────────────
         self.tx_queue: deque[str] = deque()
         self.header: List[str] = []
         self.name_to_idx: Dict[str, int] = {}
         self._stop = False
 
-        # ── State for processing ───────────────────────────────────────────────
-        # Unwrapped positions (pre-filter)
+        # ── State holders ─────────────────────────────────────────────────────
+        self._last_valid_motor_pos_norm: Optional[float] = None
+        self._last_valid_sync_raw: Optional[int] = None
+
         self._motor_unwrapped_rev: Optional[float] = None
         self._roller_unwrapped_counts: Optional[float] = None
 
-        # Filtered positions history (for windowed derivative)
         self._hist_pos_motor_filt: deque = deque(maxlen=8)
         self._hist_pos_roller_filt: deque = deque(maxlen=8)
 
-        # Speeds (rev/s)
         self.motor_speed: float = 0.0
         self.sync_roller_speed: float = 0.0
+
+        self.brake_status: bool = False
+        self.current = None
+        self.motor_torque = None
+        self.tau_motor: float = float("nan")
+        self.syncronous_roller_raw_wrapped = None
+        self.motor_position = None
+
+        self._motor_rev_zero: Optional[float] = None
+        self._roller_counts_zero: Optional[float] = None
+        self.rope_length_m: float = 0.0
+
+        # High-level rope control state.
+        self.active_rope_control_mode = "idle"
+        self.rope_position_ref_m = None
+        self._last_position_loop_log_time = 0.0
+        self._last_position_ref_log_time = 0.0
+
+        # Gear ratio:
+        # G = omega_roller / omega_motor
+        # Starts nominal, then updates online when motion is reliable.
+        self.variable_gear_ratio_g: float = self.gear_ratio_nominal
+        self._freeze_g = not self.gear_ratio_update_enabled
+        self._gear_print_counter = 0
+
+        self.get_logger().info(
+            f"[gear] initial G={self.variable_gear_ratio_g:.3f}, "
+            f"update_enabled={self.gear_ratio_update_enabled}, "
+            f"limits=[{self.gear_ratio_min:.2f}, {self.gear_ratio_max:.2f}]"
+        )
 
         # ── SYNC & CONFIG ─────────────────────────────────────────────────────
         if self.send_sync_on_start:
             self._send_sync()
+
         if self.resync_interval_s > 0:
             self.create_timer(self.resync_interval_s, self._send_sync)
 
@@ -165,27 +239,27 @@ class TelemetryNode(Node):
         else:
             self.get_logger().warn("No CONFIG JSON found; device may not stream.")
 
-        # ── Start IO threads ───────────────────────────────────────────────────
+        # ── Rope position outer-loop timer ────────────────────────────────────
+        # Runs only when closed_loop_position is requested and a finite rope_position reference is received.
+        self.position_loop_timer = self.create_timer(0.02, self._rope_position_outer_loop_cb)
+
+        # ── Start IO threads ──────────────────────────────────────────────────
         threading.Thread(target=self._serial_reader_loop, name="serial-reader", daemon=True).start()
         threading.Thread(target=self._serial_writer_loop, name="serial-writer", daemon=True).start()
 
         if self.debug_mode:
             threading.Thread(target=self._stdin_loop, name="stdin", daemon=True).start()
 
-        self.variable_gear_ratio_g: float = 2.31 #60 / 26 mm for testing fixed
-        self._freeze_g = True
-        self.tau_motor: float = float("nan")
-        # Rope-length zero reference (first valid sample → 0 m)
-        self._roller_counts_zero: Optional[float] = None
-        self.rope_length_m: float = 0.0
-
-
-    # ── Public: enqueue a raw line to MCU ──────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public: enqueue raw line to MCU
+    # ─────────────────────────────────────────────────────────────────────────
     def send_cmd(self, line: str) -> None:
         if line:
             self.tx_queue.append(line if line.endswith("\n") else (line + "\n"))
 
-    # ── Brake services ────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Brake services
+    # ─────────────────────────────────────────────────────────────────────────
     def _srv_brake_engage(self, req, res):
         cmd = "set_brake 1"
         self.get_logger().info(f"→ {cmd}")
@@ -201,139 +275,317 @@ class TelemetryNode(Node):
         res.success = True
         res.message = "sent: set_brake 0"
         return res
-    
-    def _srv_rope_zero(self, req, res):
-        """
-        Zero rope length using the current filtered roller counts.
-        Also aligns the motor reference so rope_position=0 maps to 'now'.
-        """
-        if getattr(self, "_pos_roller_filt", None) is None:
-            res.success = False
-            res.message = "No roller data yet; cannot zero."
-            return res
 
-        # 1) Zero rope length
-        self._roller_counts_zero = float(self._pos_roller_filt)
-        self.rope_length_m = 0.0
-
-        # 2) Align motor reference for absolute rope position commands
-        motor_now = getattr(self, "_pos_motor_filt", None)
-        if motor_now is None:
-            motor_now = getattr(self, "_motor_unwrapped_rev", None)
-        if motor_now is not None:
-            self._motor_rev_zero = float(motor_now)
-
-        res.success = True
-        res.message = "Rope zeroed (and motor reference aligned)."
-        self.get_logger().info(
-            f"✔ Rope zeroed: rope_length_m=0.0; motor_ref={getattr(self, '_motor_rev_zero', float('nan'))}"
-        )
-        return res
-
-
-
-    # New: manual sync service
     def _srv_sync_now(self, req, res):
         epoch = self._send_sync()
         res.success = True
         res.message = f"sent: sync {epoch}"
         return res
 
-    # ── set_motor_mode callback ───────────────────────────────────────────────
+    def _srv_rope_zero(self, req, res):
+        if getattr(self, "_pos_roller_filt", None) is None:
+            res.success = False
+            res.message = "No roller data yet; cannot zero."
+            return res
+
+        self._roller_counts_zero = float(self._pos_roller_filt)
+        self.rope_length_m = 0.0
+
+        motor_now = getattr(self, "_pos_motor_filt", None)
+        if motor_now is None:
+            motor_now = getattr(self, "_motor_unwrapped_rev", None)
+
+        if motor_now is not None:
+            self._motor_rev_zero = float(motor_now)
+
+        res.success = True
+        res.message = "Rope zeroed and motor reference aligned."
+        self.get_logger().info(
+            f"✔ Rope zeroed: rope_length_m=0.0; "
+            f"motor_ref={getattr(self, '_motor_rev_zero', float('nan'))}"
+        )
+        return res
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Motor mode callback
+    # ─────────────────────────────────────────────────────────────────────────
     def _set_motor_mode_cb(self, msg: String) -> None:
         m = (msg.data or "").strip().lower()
+
         if m == "idle":
+            self.active_rope_control_mode = "idle"
+            self.rope_position_ref_m = None
             self.send_cmd("send_odrive w axis0.requested_state 1")
-        elif m == "closed_loop_torque":
+
+        elif m in ("closed_loop_torque", "close_loop_torque"):
+            self.active_rope_control_mode = "closed_loop_torque"
+            self.rope_position_ref_m = None
             self.send_cmd("send_odrive w axis0.controller.config.input_mode 1")
             self.send_cmd("send_odrive w axis0.controller.config.control_mode 1")
             self.send_cmd("send_odrive w axis0.requested_state 8")
-        elif m == "closed_loop_velocity":
+
+        elif m in ("closed_loop_velocity", "close_loop_velocity", "closed_loop_velocoty", "close_loop_velocoty"):
+            self.active_rope_control_mode = "closed_loop_velocity"
+            self.rope_position_ref_m = None
             self.send_cmd("send_odrive w axis0.controller.config.input_mode 1")
             self.send_cmd("send_odrive w axis0.controller.config.control_mode 2")
             self.send_cmd("send_odrive w axis0.requested_state 8")
-        elif m == "closed_loop_position":
-            self.send_cmd("send_odrive w axis0.controller.config.input_mode 1")
-            self.send_cmd("send_odrive w axis0.controller.config.control_mode 3")
-            self.send_cmd("send_odrive w axis0.requested_state 8")
+
+        elif m in ("closed_loop_position", "close_loop_position"):
+            self.active_rope_control_mode = "closed_loop_position"
+
+            if self.rope_position_outer_loop_enabled:
+                # External interface stays "position mode", but internally we use
+                # rope_length feedback and ODrive velocity mode for robust rope position control.
+                self.send_cmd("send_odrive w axis0.controller.config.input_mode 1")
+                self.send_cmd("send_odrive w axis0.controller.config.control_mode 2")
+                self.send_cmd("send_odrive w axis0.requested_state 8")
+                self.get_logger().warn(
+                    "closed_loop_position requested: using ROS2 outer loop on rope_length + ODrive velocity mode"
+                )
+            else:
+                self.send_cmd("send_odrive w axis0.controller.config.input_mode 1")
+                self.send_cmd("send_odrive w axis0.controller.config.control_mode 3")
+                self.send_cmd("send_odrive w axis0.requested_state 8")
+
         else:
             self.get_logger().warn(
-                "Unknown motor mode. Use: idle, closed_loop_torque, closed_loop_velocity, closed_loop_position"
+                "Unknown motor mode. Use: idle, closed_loop_torque, "
+                "closed_loop_velocity, closed_loop_position"
             )
 
-    # ── rope_command_callback ────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Rope command callback
+    # ─────────────────────────────────────────────────────────────────────────
     def _rope_command_cb(self, msg: RopeCommand) -> None:
-        # Log incoming rope-space request
         self.get_logger().info(
-            f"[command] force={msg.rope_force:.3f} N, vel={msg.rope_velocity:.3f} m/s, pos={msg.rope_position:.3f} m"
+            f"[command] force={msg.rope_force:.3f} N, "
+            f"vel={msg.rope_velocity:.3f} m/s, "
+            f"pos={msg.rope_position:.3f} m"
         )
 
-        # Geometry
         r0 = float(self.sync_roller_radius_m)
-        d  = float(self.rope_diameter_m)
+        d = float(self.rope_diameter_m)
         r_eff = r0 + 0.5 * d
         two_pi = 2.0 * math.pi
 
-        # Live gear ratio (frozen/smoothed elsewhere if you enable it)
         G = float(self.variable_gear_ratio_g)
         if not (math.isfinite(G) and G > 1e-6):
-            G = 1.0
-            self.get_logger().warn("Gear ratio not valid; using G=1.0 fallback for conversions.")
+            G = self.gear_ratio_nominal if self.gear_ratio_nominal > 1e-6 else 1.0
+            self.get_logger().warn(f"Gear ratio invalid; using fallback G={G:.3f}")
 
-        # --- Torque (N·m): τm = F * G * r_eff ---
+        # Torque command:
+        # tau_motor = F_rope * G * r_eff
         if math.isfinite(msg.rope_force):
             tau_motor = float(msg.rope_force) * G * r_eff
             self.send_cmd(f"send_odrive w axis0.controller.input_torque {tau_motor:.6f}")
         else:
             tau_motor = float("nan")
 
-        # --- Velocity (turns/s): ωm = (v / r_eff) / (2π * G) ---
+        # Velocity command:
+        # omega_motor_turns_s = rope_velocity / (2*pi*r_eff*G)
         if math.isfinite(msg.rope_velocity):
-            motor_vel_turns_s = (float(msg.rope_velocity) / max(r_eff, 1e-9)) / (two_pi * max(G, 1e-9))
+            motor_vel_turns_s = (
+                float(msg.rope_velocity) / max(r_eff, 1e-9)
+            ) / (two_pi * max(G, 1e-9))
             self.send_cmd(f"send_odrive w axis0.controller.input_vel {motor_vel_turns_s:.6f}")
         else:
             motor_vel_turns_s = float("nan")
 
-        # --- Position (turns, ABSOLUTE): θm_abs = θm_zero + (x / r_eff) / (2π * G) ---
+        # Position command:
+        # If outer-loop mode is enabled, keep the external interface as position control
+        # but store the rope position reference and let _rope_position_outer_loop_cb()
+        # command ODrive velocity until measured rope_length converges.
         if math.isfinite(msg.rope_position):
-            base_turns = float(self._motor_rev_zero) if getattr(self, "_motor_rev_zero", None) is not None else 0.0
-            delta_turns = (float(msg.rope_position) / max(r_eff, 1e-9)) / (two_pi * max(G, 1e-9))
-            motor_pos_turns_abs = base_turns + delta_turns
-            self.send_cmd(f"send_odrive w axis0.controller.input_pos {motor_pos_turns_abs:.6f}")
+            if self.rope_position_outer_loop_enabled and self.active_rope_control_mode == "closed_loop_position":
+                self.rope_position_ref_m = float(msg.rope_position)
+                motor_pos_turns_abs = float("nan")
+
+                now = time.time()
+                if now - self._last_position_ref_log_time > 0.5:
+                    self._last_position_ref_log_time = now
+                    self.get_logger().info(
+                        f"→ rope position reference stored: {self.rope_position_ref_m:.4f} m"
+                    )
+            else:
+                base_turns = (
+                    float(self._motor_rev_zero)
+                    if getattr(self, "_motor_rev_zero", None) is not None
+                    else 0.0
+                )
+
+                cal = max(abs(float(self.rope_position_calibration)), 1e-9)
+
+                delta_turns_raw = (
+                    float(msg.rope_position) / max(r_eff, 1e-9)
+                ) / (two_pi * max(G, 1e-9))
+
+                delta_turns = delta_turns_raw / cal
+                motor_pos_turns_abs = base_turns + delta_turns
+
+                self.send_cmd(f"send_odrive w axis0.controller.input_pos {motor_pos_turns_abs:.6f}")
         else:
             motor_pos_turns_abs = float("nan")
 
         self.get_logger().info(
             f"→ mapped: τ={tau_motor if math.isfinite(tau_motor) else float('nan'):.3f} N·m, "
             f"vel={motor_vel_turns_s if math.isfinite(motor_vel_turns_s) else float('nan'):.3f} trn/s, "
-            f"pos_abs={motor_pos_turns_abs if math.isfinite(motor_pos_turns_abs) else float('nan'):.3f} trn "
-            f"(G={G:.3f}, r_eff={r_eff:.4f} m, θ0={getattr(self, '_motor_rev_zero', float('nan'))})"
+            f"pos_abs={motor_pos_turns_abs if math.isfinite(motor_pos_turns_abs) else float('nan'):.6f} trn "
+            f"(G={G:.3f}, r_eff={r_eff:.4f} m, "
+            f"cal_pos={getattr(self, 'rope_position_calibration', float('nan')):.3f}, "
+            f"θ0={getattr(self, '_motor_rev_zero', float('nan'))})"
         )
 
-    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Rope position outer-loop controller
+    # ─────────────────────────────────────────────────────────────────────────
+    def _rope_position_outer_loop_cb(self):
+        if not getattr(self, "rope_position_outer_loop_enabled", False):
+            return
 
+        if getattr(self, "active_rope_control_mode", "idle") != "closed_loop_position":
+            return
 
-    # ── Reader/Writer loops ───────────────────────────────────────────────────
+        if self.rope_position_ref_m is None:
+            return
+
+        if bool(getattr(self, "brake_status", False)):
+            # Do not fight the brake.
+            return
+
+        actual = float(getattr(self, "rope_length_m", 0.0))
+        ref = float(self.rope_position_ref_m)
+        error = ref - actual
+
+        if abs(error) < float(self.rope_position_deadband_m):
+            vel_cmd_m_s = 0.0
+        else:
+            vel_cmd_m_s = float(self.rope_position_kp) * error
+
+        vmax = abs(float(self.rope_position_max_vel_m_s))
+        vel_cmd_m_s = max(-vmax, min(vmax, vel_cmd_m_s))
+
+        r0 = float(self.sync_roller_radius_m)
+        d = float(self.rope_diameter_m)
+        r_eff = r0 + 0.5 * d
+        two_pi = 2.0 * math.pi
+
+        G = float(self.variable_gear_ratio_g)
+        if not (math.isfinite(G) and G > 1e-6):
+            G = self.gear_ratio_nominal if self.gear_ratio_nominal > 1e-6 else 1.0
+
+        motor_vel_turns_s = (
+            vel_cmd_m_s / max(r_eff, 1e-9)
+        ) / (two_pi * max(G, 1e-9))
+
+        self.send_cmd(f"send_odrive w axis0.controller.input_vel {motor_vel_turns_s:.6f}")
+
+        now = time.time()
+        if now - self._last_position_loop_log_time > 0.5:
+            self._last_position_loop_log_time = now
+            self.get_logger().info(
+                f"[rope_pos_loop] ref={ref:.4f} m, actual={actual:.4f} m, "
+                f"err={error:.4f} m, v_cmd={vel_cmd_m_s:.4f} m/s, "
+                f"motor_vel={motor_vel_turns_s:.5f} turn/s"
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Variable gear ratio estimator
+    # ─────────────────────────────────────────────────────────────────────────
+    def _update_variable_gear_ratio(self):
+        """
+        Estimate:
+
+            G = abs(sync_roller_speed / motor_speed)
+
+        both in rev/s.
+
+        Updates only when:
+          - estimator enabled
+          - brake not active
+          - motor and roller speeds are large enough
+          - measured G is inside limits
+          - measured G is not a sudden impossible jump
+        """
+
+        if getattr(self, "_freeze_g", True):
+            return
+
+        try:
+            motor_sp = float(self.motor_speed)
+            roller_sp = float(self.sync_roller_speed)
+
+            if not math.isfinite(motor_sp) or not math.isfinite(roller_sp):
+                return
+
+            if bool(getattr(self, "brake_status", False)):
+                return
+
+            if abs(motor_sp) < self.gear_ratio_motor_eps:
+                return
+
+            if abs(roller_sp) < self.gear_ratio_roller_eps:
+                return
+
+            G_meas = abs(roller_sp / motor_sp)
+
+            if not math.isfinite(G_meas):
+                return
+
+            if G_meas < self.gear_ratio_min or G_meas > self.gear_ratio_max:
+                return
+
+            G_old = float(self.variable_gear_ratio_g)
+
+            if not math.isfinite(G_old) or G_old <= 0.0:
+                self.variable_gear_ratio_g = G_meas
+                return
+
+            # Reject sudden jumps. This prevents encoder glitches from corrupting G.
+            if abs(G_meas - G_old) > self.gear_ratio_max_step:
+                return
+
+            alpha = max(0.0, min(1.0, float(self.gear_ratio_alpha)))
+            self.variable_gear_ratio_g = (1.0 - alpha) * G_old + alpha * G_meas
+
+            self._gear_print_counter += 1
+            if self._gear_print_counter >= self.gear_ratio_log_period:
+                self._gear_print_counter = 0
+                self.get_logger().info(
+                    f"[gear] G={self.variable_gear_ratio_g:.3f}, "
+                    f"G_meas={G_meas:.3f}, "
+                    f"motor_sp={motor_sp:.3f} rev/s, "
+                    f"roller_sp={roller_sp:.3f} rev/s"
+                )
+
+        except Exception as e:
+            self.get_logger().warn(f"Gear ratio update failed: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Reader / writer threads
+    # ─────────────────────────────────────────────────────────────────────────
     def _serial_reader_loop(self) -> None:
-        """Decode lines from serial and hand them to process_csv(line)."""
         while not self._stop:
             try:
                 if not self.ser.in_waiting:
                     time.sleep(0.0005)
                     continue
-                raw = self.ser.readline()  # up to '\n' or timeout
+
+                raw = self.ser.readline()
                 if not raw:
                     continue
+
                 line = raw.decode(errors="ignore").strip()
                 if not line:
                     continue
+
                 self.process_csv(line)
+
             except Exception as e:
                 self.get_logger().warn(f"Serial read error: {e}")
                 time.sleep(0.01)
 
     def _serial_writer_loop(self) -> None:
-        """Sends queued commands in FIFO bursts when RX is idle."""
         while not self._stop:
             try:
                 if self.tx_queue and not self.ser.in_waiting:
@@ -344,24 +596,32 @@ class TelemetryNode(Node):
                         self.ser.write(out.encode("utf-8"))
                 else:
                     time.sleep(0.0005)
+
             except Exception as e:
                 self.get_logger().warn(f"Serial write error: {e}")
                 time.sleep(0.01)
 
-    # ── Process one CSV line ──────────────────────────────────────────────────
+
+    def _safe_int(self, value, default=0):
+        try:
+            x = float(value)
+            if not math.isfinite(x):
+                return default
+            return int(round(x))
+        except Exception:
+            return default
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Process CSV
+    # ─────────────────────────────────────────────────────────────────────────
     def process_csv(self, line: str) -> None:
-        """
-        Fixed-dt (from poll_rate_hz), LPF on positions, windowed derivative.
-        Publishes DebugMessage.
-        """
-        # 0) republish raw CSV
         self.pub_csv.publish(String(data=line))
 
-        # 1) parse row & header
         try:
             row = next(csv.reader([line]))
         except Exception:
             return
+
         if not row:
             return
 
@@ -369,6 +629,7 @@ class TelemetryNode(Node):
             self.header = [h.strip() for h in row]
             self.name_to_idx = {n: i for i, n in enumerate(self.header)}
             return
+
         if self.expect_header and not self.header:
             return
 
@@ -379,7 +640,7 @@ class TelemetryNode(Node):
             i = idx(name, pos)
             return row[i].strip() if 0 <= i < len(row) else None
 
-        # 2) timestamp (kept only for logging; derivatives use fixed dt)
+        # Timestamp, mostly for possible future logging
         t_s = None
         s = cell("epoch_ms", 0)
         if s not in (None, ""):
@@ -387,6 +648,7 @@ class TelemetryNode(Node):
                 t_s = float(s) / 1_000.0
             except Exception:
                 t_s = None
+
         if t_s is None:
             s = cell("micros", 0)
             if s not in (None, ""):
@@ -394,11 +656,12 @@ class TelemetryNode(Node):
                     t_s = float(s) / 1_000_000.0
                 except Exception:
                     t_s = None
+
         if t_s is None:
             t_s = time.time()
 
-        # 3) raw fields
-        brake_status = (cell("brake", 1) in ("1", "true", "True", "TRUE"))
+        # Raw fields
+        brake_status = cell("brake", 1) in ("1", "true", "True", "TRUE")
 
         s = cell("ibus", 2)
         try:
@@ -418,11 +681,7 @@ class TelemetryNode(Node):
         except Exception:
             sync_raw = None
 
-        # Ensure the holder exists even if __init__ changes order
-        if not hasattr(self, "_last_valid_sync_raw"):
-            self._last_valid_sync_raw = None
-
-        # HOLD last valid if current is 0 or None
+        # Hold last valid sync raw if current is missing or zero.
         sr = sync_raw
         if sr is None or sr == 0:
             if self._last_valid_sync_raw is not None:
@@ -431,14 +690,25 @@ class TelemetryNode(Node):
             self._last_valid_sync_raw = sr
 
         sync_raw = sr
-        sync_raw = self.glitch_outlier_filter(sync_raw,
-                                      name="sync_raw",
-                                      window=15,
-                                      k=3.5,
-                                      max_step=self.max_roller_rps * self.sync_roller_cpr / self.poll_rate_hz,
-                                      persist=3)
+        sync_raw = self.glitch_outlier_filter(
+            sync_raw,
+            name="sync_raw",
+            window=15,
+            k=3.5,
+            max_step=self.max_roller_rps * self.sync_roller_cpr / self.poll_rate_hz,
+            persist=3
+        )
 
+        # Safety: avoid inf/nan reaching int(...)
+        if sync_raw is not None:
+            try:
+                if not math.isfinite(float(sync_raw)):
+                    sync_raw = self._last_valid_sync_raw
+            except Exception:
+                sync_raw = self._last_valid_sync_raw
 
+        if sync_raw is not None:
+            sync_raw = self._safe_int(sync_raw, default=0)
 
         # motor_raw_wrapped: normalized [0,1)
         s = cell("motor_raw_wrapped", 5)
@@ -447,11 +717,6 @@ class TelemetryNode(Node):
         except Exception:
             motor_pos_norm = None
 
-        # Ensure the holder exists even if __init__ ever changes order
-        if not hasattr(self, "_last_valid_motor_pos_norm"):
-            self._last_valid_motor_pos_norm = None
-
-        # HOLD last valid if current is 0.0 or None
         mp = motor_pos_norm
         if mp is None or mp == 0.0:
             if self._last_valid_motor_pos_norm is not None:
@@ -459,16 +724,12 @@ class TelemetryNode(Node):
         else:
             self._last_valid_motor_pos_norm = mp
 
-        motor_pos_norm = mp
-        motor_pos_norm = self.moving_average_filter(motor_pos_norm,window=25,name="motor_pos")
+        motor_pos_norm = self.moving_average_filter(mp, window=25, name="motor_pos")
 
-
-        # 4) constants for math
-        poll_rate_hz = self.poll_rate_hz
-        fixed_dt = 1.0 / max(1e-6, poll_rate_hz)
-
-        cpr_i = int(self.sync_roller_cpr)     # modulo uses int
-        cpr = float(cpr_i)                    # math uses float
+        # Constants
+        fixed_dt = 1.0 / max(1e-6, self.poll_rate_hz)
+        cpr_i = int(self.sync_roller_cpr)
+        cpr = float(cpr_i)
         radius_m = float(self.sync_roller_radius_m)
 
         max_motor_rps = self.max_motor_rps
@@ -480,11 +741,8 @@ class TelemetryNode(Node):
         phys_max_rope_m_s = self.phys_max_rope_m_s
         tau2pi = 2.0 * math.pi
 
-        # Effective rope radius: r_eff = r0 + d/2
-        rope_diameter_m = float(self.rope_diameter_m)
-        r_eff = radius_m + 0.5 * rope_diameter_m
+        r_eff = radius_m + 0.5 * float(self.rope_diameter_m)
 
-        # helper: 1st-order LPF on positions
         def lpf_pos(prev_val: Optional[float], x: Optional[float], dt: float, fc: float) -> Optional[float]:
             if x is None:
                 return prev_val
@@ -494,7 +752,7 @@ class TelemetryNode(Node):
             a = dt / (tau + dt)
             return prev_val + a * (x - prev_val)
 
-        # 5) unwrap motor (0..1) → continuous rev
+        # Unwrap motor position
         motor_unwrapped_rev = self._motor_unwrapped_rev
         if motor_pos_norm is not None:
             if motor_unwrapped_rev is None:
@@ -502,16 +760,20 @@ class TelemetryNode(Node):
             else:
                 frac_prev = motor_unwrapped_rev - math.floor(motor_unwrapped_rev)
                 dm = motor_pos_norm - frac_prev
+
                 if dm > 0.5:
                     dm -= 1.0
-                if dm < -0.5:
+                elif dm < -0.5:
                     dm += 1.0
+
                 motor_unwrapped_rev = motor_unwrapped_rev + dm
+
         if motor_unwrapped_rev is None:
             motor_unwrapped_rev = self._motor_unwrapped_rev
+
         self._motor_unwrapped_rev = motor_unwrapped_rev
 
-        # 6) unwrap roller (0..CPR-1) → continuous counts
+        # Unwrap roller counts
         roller_unwrapped_counts = self._roller_unwrapped_counts
         if sync_raw is not None:
             if roller_unwrapped_counts is None:
@@ -520,69 +782,80 @@ class TelemetryNode(Node):
                 prev_wrap = int(round(roller_unwrapped_counts)) % cpr_i
                 dr = int(sync_raw) - prev_wrap
                 half = cpr / 2.0
+
                 if dr > half:
                     dr -= cpr_i
                 elif dr < -half:
                     dr += cpr_i
+
                 if abs(dr) < count_deadband:
                     dr = 0
+
                 roller_unwrapped_counts = roller_unwrapped_counts + float(dr)
+
         if roller_unwrapped_counts is None:
             roller_unwrapped_counts = self._roller_unwrapped_counts
+
         self._roller_unwrapped_counts = roller_unwrapped_counts
 
-        # 7) LPF on positions (NOT on velocity)
+        # LPF positions
         if not hasattr(self, "_pos_motor_filt"):
             self._pos_motor_filt = motor_unwrapped_rev
         else:
-            self._pos_motor_filt = lpf_pos(self._pos_motor_filt, motor_unwrapped_rev, fixed_dt, lpf_fc_pos_motor)
+            self._pos_motor_filt = lpf_pos(
+                self._pos_motor_filt,
+                motor_unwrapped_rev,
+                fixed_dt,
+                lpf_fc_pos_motor,
+            )
 
         if not hasattr(self, "_pos_roller_filt"):
             self._pos_roller_filt = roller_unwrapped_counts
         else:
-            self._pos_roller_filt = lpf_pos(self._pos_roller_filt, roller_unwrapped_counts, fixed_dt, lpf_fc_pos_roller)
+            self._pos_roller_filt = lpf_pos(
+                self._pos_roller_filt,
+                roller_unwrapped_counts,
+                fixed_dt,
+                lpf_fc_pos_roller,
+            )
 
-        # push to history for windowed derivative
         self._hist_pos_motor_filt.append(self._pos_motor_filt)
         self._hist_pos_roller_filt.append(self._pos_roller_filt)
 
-        # 8) windowed derivative using fixed dt (with outlier HOLD)
-        motor_sp = float(self.motor_speed)            # start from last valid (hold)
+        # Windowed derivative
+        motor_sp = float(self.motor_speed)
         roller_sp = float(self.sync_roller_speed)
 
         if len(self._hist_pos_motor_filt) >= 2:
-            k = min(5, len(self._hist_pos_motor_filt) - 1)  # 2..6 samples
+            k = min(5, len(self._hist_pos_motor_filt) - 1)
             dtw = k * fixed_dt
 
-            # motor rev/s
             p_now = self._hist_pos_motor_filt[-1]
             p_old = self._hist_pos_motor_filt[-1 - k]
             if p_now is not None and p_old is not None and dtw > 0:
                 motor_sp_candidate = (p_now - p_old) / dtw
                 if abs(motor_sp_candidate) <= max_motor_rps * 1.5:
-                    motor_sp = motor_sp_candidate  # accept; else hold previous
+                    motor_sp = motor_sp_candidate
 
-            # roller rev/s from counts
             r_now = self._hist_pos_roller_filt[-1]
             r_old = self._hist_pos_roller_filt[-1 - k]
             if r_now is not None and r_old is not None and dtw > 0:
-                dr_counts = (r_now - r_old)
+                dr_counts = r_now - r_old
                 roller_sp_candidate = (dr_counts / cpr) / dtw
                 if abs(roller_sp_candidate) <= max_roller_rps * 1.5:
-                    roller_sp = roller_sp_candidate  # accept; else hold previous
+                    roller_sp = roller_sp_candidate
 
-        # brake gating: zero + reseed filtered positions
-        if brake_status and (abs(motor_sp) < brake_zero_rps) and (abs(roller_sp) < brake_zero_rps):
+        # Brake gating
+        if brake_status and abs(motor_sp) < brake_zero_rps and abs(roller_sp) < brake_zero_rps:
             motor_sp = 0.0
             roller_sp = 0.0
             self._pos_motor_filt = motor_unwrapped_rev
             self._pos_roller_filt = roller_unwrapped_counts
 
-        # write filtered speeds back
         self.motor_speed = float(motor_sp)
         self.sync_roller_speed = float(roller_sp)
 
-        # 9) update public state and publish DebugMessage
+        # Public state
         self.brake_status = bool(brake_status)
         self.current = current
         self.motor_torque = motor_torque
@@ -590,16 +863,19 @@ class TelemetryNode(Node):
         self.syncronous_roller_raw_wrapped = sync_raw
         self.motor_position = motor_pos_norm
 
-        motor_speed_rad_s  = self.motor_speed * tau2pi
+        motor_speed_rad_s = self.motor_speed * tau2pi
         roller_speed_rad_s = self.sync_roller_speed * tau2pi
-        rope_speed_m_s     = roller_speed_rad_s * r_eff   # <-- use r_eff
+        rope_speed_m_s = roller_speed_rad_s * r_eff
 
-        # final rope sanity (and hold)
         if abs(rope_speed_m_s) > phys_max_rope_m_s:
             rope_speed_m_s = 0.0
             roller_speed_rad_s = 0.0
             self.sync_roller_speed = 0.0
 
+        # Update gear ratio AFTER speeds are filtered and sanity-checked
+        self._update_variable_gear_ratio()
+
+        # Publish debug
         m = DebugMessage()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = f"winch_{self.side}"
@@ -613,9 +889,11 @@ class TelemetryNode(Node):
         m.brake = bool(self.brake_status)
         m.current = to_f(self.current) if self.current is not None else float("nan")
         m.motor_torque = to_f(self.motor_torque) if self.motor_torque is not None else float("nan")
-        m.syncronous_roller_raw_wrapped = int(self.syncronous_roller_raw_wrapped) if self.syncronous_roller_raw_wrapped is not None else 0
+        m.syncronous_roller_raw_wrapped = self._safe_int(
+            self.syncronous_roller_raw_wrapped,
+            default=0
+        )
         m.motor_position = to_f(self.motor_position) if self.motor_position is not None else float("nan")
-
         m.motor_speed_rev_s = to_f(self.motor_speed)
         m.motor_speed_rad_s = to_f(motor_speed_rad_s)
         m.sync_roller_speed_rev_s = to_f(self.sync_roller_speed)
@@ -624,90 +902,98 @@ class TelemetryNode(Node):
 
         self.pub_debug.publish(m)
 
-        # --- Variable gear ratio G = w_roller / w_motor (dimensionless) ---
-        motor_eps = 1e-6  # rev/s
-        if not getattr(self, "_freeze_g", False) and abs(self.motor_speed) > motor_eps:
-            G_new = float(self.sync_roller_speed / self.motor_speed)
-            if math.isfinite(G_new):
-                self.variable_gear_ratio_g = max(0.01, min(200.0, G_new))
-        # else: keep previous self.variable_gear_ratio_g
-
-        # --- Rope length (m) from filtered roller counts (use r_eff) ---
+        # Rope length from roller
         if getattr(self, "_pos_roller_filt", None) is not None:
             zero = getattr(self, "_roller_counts_zero", None)
             if zero is None:
                 self._roller_counts_zero = float(self._pos_roller_filt)
                 zero = self._roller_counts_zero
-            counts_rel = (self._pos_roller_filt - zero)
+
+            counts_rel = self._pos_roller_filt - zero
             rope_length_m = (counts_rel / cpr) * tau2pi * r_eff
             self.rope_length_m = float(rope_length_m)
         else:
             rope_length_m = getattr(self, "rope_length_m", 0.0)
 
+        # Rope force
+        G = float(self.variable_gear_ratio_g)
+        if not math.isfinite(G) or G <= 1e-9:
+            G = self.gear_ratio_nominal if self.gear_ratio_nominal > 1e-9 else 1.0
 
-        # --- Rope force (N): F = τm / (G * r_eff) ---
-        G = float(self.variable_gear_ratio_g) if math.isfinite(self.variable_gear_ratio_g) else 1.0
-        den = max(r_eff * max(G, 1e-9), 1e-9)                # <-- use r_eff
+        den = max(r_eff * G, 1e-9)
+
         rope_force = float("nan")
         if self.tau_motor is not None and math.isfinite(self.tau_motor):
             rope_force = float(self.tau_motor) / den
 
-        # --- Publish RopeTelemetry ---
+        # Publish RopeTelemetry
         rt = RopeTelemetry()
-        rt.header.stamp = self.get_clock().now().to_msg()   # no frame_id set
-        rt.rope_force    = to_f(rope_force)
-        rt.rope_length   = to_f(rope_length_m)
+        rt.header.stamp = self.get_clock().now().to_msg()
+        rt.rope_force = to_f(rope_force)
+        rt.rope_length = to_f(rope_length_m)
         rt.rope_velocity = to_f(rope_speed_m_s)
-        rt.current       = to_f(self.current) if self.current is not None else float("nan")
-        rt.brake_status  = bool(self.brake_status)
+        rt.current = to_f(self.current) if self.current is not None else float("nan")
+        rt.brake_status = bool(self.brake_status)
+
         self.pub_rope.publish(rt)
 
-
-
-
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────────────────
     def _load_config(self, path: str) -> Optional[dict]:
         try:
             p = Path(path)
             if not p.exists():
                 alt = Path(__file__).resolve().parent.parent / "config" / "arganelloTelemetry.json"
                 p = alt if alt.exists() else p
+
             if not p.exists():
                 return None
+
             with p.open("r", encoding="utf-8") as f:
                 return json.load(f)
+
         except Exception as e:
             self.get_logger().error(f"Failed to load CONFIG: {e}")
             return None
 
     def _stdin_loop(self) -> None:
-        import sys, select
+        import sys
+        import select
+
         prompt = f"[{self.get_name()}:{self.side}]> "
-        sys.stdout.write(prompt); sys.stdout.flush()
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+
         while not self._stop:
             r, _, _ = select.select([sys.stdin], [], [], 0.1)
             if not r:
                 continue
+
             line = sys.stdin.readline()
             if not line:
                 continue
+
             line = line.strip()
             if not line:
-                sys.stdout.write(prompt); sys.stdout.flush()
+                sys.stdout.write(prompt)
+                sys.stdout.flush()
                 continue
+
             if line in ("quit", "exit"):
                 self.get_logger().info("Exiting debug console…")
                 break
-            self.send_cmd(line)
-            sys.stdout.write(prompt); sys.stdout.flush()
 
-    # ── SYNC helpers ─────────────────────────────────────────────────────────
+            self.send_cmd(line)
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+
     def _send_sync(self):
         if self.sync_epoch_unit == "ns":
             epoch = time.time_ns()
         else:
-            epoch = int(time.time_ns() // 1_000_000)  # ms since epoch
+            epoch = int(time.time_ns() // 1_000_000)
+
         cmd = f"sync {epoch}"
         self.get_logger().info(f"→ {cmd}")
         self.send_cmd(cmd)
@@ -722,162 +1008,134 @@ class TelemetryNode(Node):
             pass
         super().destroy_node()
 
-
-    # ── filter helpers ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Filter helpers
+    # ─────────────────────────────────────────────────────────────────────────
     def moving_average_filter(self, value, window=5, name="default"):
-        """
-        Moving-average filter that preserves int/float type and is None-safe.
-        - If value is None: return last filtered value for this 'name' (or None if none yet),
-        and do NOT update the window.
-        """
-        # per-signal state names
         hist_name = f"_ma_hist_{name}"
         last_name = f"_ma_last_{name}"
 
-        # init state if missing
         if not hasattr(self, hist_name):
             setattr(self, hist_name, deque(maxlen=max(1, int(window))))
+
         if not hasattr(self, last_name):
             setattr(self, last_name, None)
 
         hist: deque = getattr(self, hist_name)
         last = getattr(self, last_name)
 
-        # invalid window => just return input
         if window < 1:
             return value
 
-        # if current sample is None, don't touch history; return last filtered
         if value is None:
-            return last  # may be None on first calls
+            return last
 
-        # normal update
         hist.append(float(value))
         avg = sum(hist) / len(hist)
 
-        # keep same type as input
         filtered = int(round(avg)) if isinstance(value, int) else avg
         setattr(self, last_name, filtered)
         return filtered
-    
 
-
-    def glitch_outlier_filter(self, value, *, name="enc", window=15, k=3.5,
-                            max_step=None, persist=2, tol_accept=None):
-        """
-        Outlier remover for fast-changing signals.
-        - Uses Hampel (median + MAD) + optional physical max_step + persistence.
-        - On a suspected glitch, it HOLDS the last accepted value.
-        - If the big change persists for `persist` samples, it is accepted.
-
-        Args:
-        value: int | float | None
-        name: separate state per signal
-        window: history size for median/MAD
-        k: Hampel sensitivity (3.0–3.5 typical)
-        max_step: optional absolute per-sample limit (same units as value)
-        persist: number of consecutive samples required to accept a big jump
-        tol_accept: small tolerance to treat two big samples as "same jump" (defaults to 1% of median or 1.0)
-
-        Returns:
-        filtered value with same type as input (int stays int), or None if no history yet.
-        """
-        hist_name   = f"_gf_hist_{name}"
-        last_name   = f"_gf_last_{name}"
-        pend_name   = f"_gf_pending_{name}"   # (pending_value, count)
+    def glitch_outlier_filter(
+        self,
+        value,
+        *,
+        name="enc",
+        window=15,
+        k=3.5,
+        max_step=None,
+        persist=2,
+        tol_accept=None,
+    ):
+        hist_name = f"_gf_hist_{name}"
+        last_name = f"_gf_last_{name}"
+        pend_name = f"_gf_pending_{name}"
         is_int = isinstance(value, int)
 
-        # None handling: hold last if we have it
         if value is None:
             return getattr(self, last_name, None)
 
         x = float(value)
-
-        # Ensure per-signal state
+        if not math.isfinite(x):
+            return getattr(self, last_name, None)
+        
         if not hasattr(self, hist_name):
             setattr(self, hist_name, deque(maxlen=max(3, window)))
+
         hist: deque = getattr(self, hist_name)
 
         if not hasattr(self, last_name):
-            setattr(self, last_name, x)  # first sample becomes last
+            setattr(self, last_name, x)
+
         if not hasattr(self, pend_name):
             setattr(self, pend_name, (None, 0))
 
         last = float(getattr(self, last_name))
         pending_val, pending_cnt = getattr(self, pend_name)
 
-        # Helper: robust median & MAD
         def med_mad(values):
             vals = list(values)
             if not vals:
                 return x, 0.0
+
             vs = sorted(vals)
             n = len(vs)
-            med = vs[n//2] if n % 2 == 1 else 0.5*(vs[n//2 - 1] + vs[n//2])
+            med = vs[n // 2] if n % 2 == 1 else 0.5 * (vs[n // 2 - 1] + vs[n // 2])
+
             abs_dev = [abs(v - med) for v in vs]
             abs_dev.sort()
-            mad = abs_dev[n//2] if n % 2 == 1 else 0.5*(abs_dev[n//2 - 1] + abs_dev[n//2])
-            # 1.4826 ≈ scale for normal distribution
+            mad = abs_dev[n // 2] if n % 2 == 1 else 0.5 * (abs_dev[n // 2 - 1] + abs_dev[n // 2])
+
             return med, 1.4826 * (mad if mad > 0 else 0.0)
 
-        # Not enough history yet → accept and learn
         if len(hist) < 3:
             hist.append(x)
             setattr(self, last_name, x)
             return int(round(x)) if is_int else x
 
         med, s = med_mad(hist)
+
         if tol_accept is None:
-            tol_accept = max(0.01 * max(abs(med), 1.0), 1.0)  # ~1% or 1 unit minimum
+            tol_accept = max(0.01 * max(abs(med), 1.0), 1.0)
 
-        # Hampel outlier test
-        is_hampel_outlier = (abs(x - med) > k * max(s, 1e-9))
+        is_hampel_outlier = abs(x - med) > k * max(s, 1e-9)
 
-        # Physical step limit (optional)
         is_step_outlier = False
         if max_step is not None:
             is_step_outlier = abs(x - last) > max_step
 
-        # If clearly not an outlier → accept immediately
         if not (is_hampel_outlier or is_step_outlier):
             hist.append(x)
             setattr(self, pend_name, (None, 0))
             setattr(self, last_name, x)
             return int(round(x)) if is_int else x
 
-        # Big change detected → require persistence
         if pending_val is None:
-            # start a pending jump
             setattr(self, pend_name, (x, 1))
-            # hold last value for now
             return int(round(last)) if is_int else last
+
+        if abs(x - pending_val) <= tol_accept:
+            pending_cnt += 1
+            setattr(self, pend_name, (pending_val, pending_cnt))
         else:
-            # If the new big sample is close to the previous pending one, accumulate
-            if abs(x - pending_val) <= tol_accept:
-                pending_cnt += 1
-                setattr(self, pend_name, (pending_val, pending_cnt))
-            else:
-                # different spike → restart pending
-                setattr(self, pend_name, (x, 1))
-                pending_cnt = 1
-                pending_val = x
+            setattr(self, pend_name, (x, 1))
+            pending_cnt = 1
+            pending_val = x
 
-            if pending_cnt >= persist:
-                # Accept the jump as real
-                hist.append(pending_val)
-                setattr(self, last_name, pending_val)
-                setattr(self, pend_name, (None, 0))
-                return int(round(pending_val)) if is_int else pending_val
-            else:
-                # Still pending → hold last
-                return int(round(last)) if is_int else last
+        if pending_cnt >= persist:
+            hist.append(pending_val)
+            setattr(self, last_name, pending_val)
+            setattr(self, pend_name, (None, 0))
+            return int(round(pending_val)) if is_int else pending_val
 
-
+        return int(round(last)) if is_int else last
 
 
 def main():
     rclpy.init()
     node = TelemetryNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -889,7 +1147,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

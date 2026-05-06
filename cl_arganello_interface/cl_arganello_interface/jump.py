@@ -546,11 +546,14 @@ if __name__ == '__main__':
 
 
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+
 from std_srvs.srv import Trigger
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from cl_arganello_interface.msg import RopeCommand
 
 
@@ -558,130 +561,267 @@ class JumpNode(Node):
     def __init__(self):
         super().__init__('jump_node')
 
-        # Publishers
         self.pub_s1 = self.create_publisher(Float32, '/alpine/dongle/servoValve1', 10)
         self.pub_s2 = self.create_publisher(Float32, '/alpine/dongle/servoValve2', 10)
+
         self.pub_left = self.create_publisher(RopeCommand, '/winch/left/command', 10)
         self.pub_right = self.create_publisher(RopeCommand, '/winch/right/command', 10)
 
-        # 100 Hz state machine
-        self.timer = self.create_timer(0.01, self.tick)
+        self.pub_left_mode = self.create_publisher(String, '/winch/left/set_motor_mode', 10)
+        self.pub_right_mode = self.create_publisher(String, '/winch/right/set_motor_mode', 10)
 
-        # Trigger service
         self.create_service(Trigger, '/alpine/jump', self.handle_jump)
+        self.create_service(Trigger, '/alpine/jump_abort', self.handle_abort)
+        self.create_service(Trigger, '/alpine/jump_stop', self.handle_stop)
 
-        # Tuning
-        self.up_force = 18.0
-        self.down_force = 6.0
-        self.hold_force = 10.0
+        self.timer = self.create_timer(0.01, self.tick)  # 100 Hz
 
-        # Sequence: (duration_ms, left_force, right_force, s1, s2)
-        # Keep phases >= 20 ms; 30–50 ms is healthier than 5 ms for your comm stack.
-        self.sequence = [
-            (220,  -self.up_force,   self.up_force,   90.0,  0.0),   # jump impulse
-            (30,   -self.up_force,   self.up_force,    0.0,  0.0),   # short flight gap
-            (900,  -self.up_force,   self.up_force,    0.0, 90.0),   # landing / exhaust
-            (600,  -self.hold_force, self.hold_force,  0.0,  0.0),   # hold
-
-            (220,  -self.down_force, self.down_force, 90.0,  0.0),   # jump impulse 2
-            (30,   -self.down_force, self.down_force,  0.0,  0.0),   # short flight gap
-            (1200, -self.down_force, self.down_force,  0.0, 90.0),   # landing / exhaust
-            (800,  -self.hold_force, self.hold_force,  0.0,  0.0),   # final hold
-        ]
-
-        # Precompute cumulative timeline
-        self.timeline = []
-        acc = 0.0
-        for dur, lf, rf, s1, s2 in self.sequence:
-            acc += float(dur)
-            self.timeline.append((acc, lf, rf, s1, s2))
-
-        # State
+        # Convenzione:
+        # left tira/riavvolge con segno negativo
+        # right tira/riavvolge con segno positivo
+        self.up_force = 25.0
+        self.hold_force = 15.0
+        self.rewind_velocity = 0.0
+        self.settle_velocity = 0.0
+        # SICUREZZA:
+        # all'avvio NON pubblica nulla sulle winch.
         self.sequence_running = False
         self.sequence_start_ms = 0.0
         self.current_phase_index = -1
-
-        # Idle
-        self.idle_lf = -self.hold_force
-        self.idle_rf = self.hold_force
-        self.idle_s1 = 0.0
-        self.idle_s2 = 0.0
-
-        # Last sent command tuple
-        self.last_sent = None
-
-        # Refresh counters
-        self.idle_refresh_div = 0
         self.phase_refresh_div = 0
+        self.last_sent = None
+        self.current_mode = None
 
-        self.get_logger().info("jump_node started (100 Hz, no blocking sleeps, no fake 500 ms delay)")
+        # Sequence:
+        # (duration_ms, mode, left_force, right_force,
+        #  left_velocity, right_velocity, s1, s2)
+        self.sequence = [
+    # Fase 1: SOLO pistone, corde ferme
+    (
+        220,
+        'torque',
+        0.0,
+        0.0,
+        float('nan'),
+        float('nan'),
+        90.0,
+        0.0,
+    ),
+
+    # Fase 2: subito dopo la spinta, corde tirano in forza mentre è in volo
+    (
+        650,
+        'torque',
+        -self.up_force,
+        self.up_force,
+        float('nan'),
+        float('nan'),
+        0.0,
+        90.0,
+    ),
+
+    # Fase 3: continua a tirare ma un po' meno, valve2 ancora aperta
+    (
+        400,
+        'torque',
+        -18.0,
+        18.0,
+        float('nan'),
+        float('nan'),
+        0.0,
+        90.0,
+    ),
+
+    # Fase 4: hold finale
+    (
+        1500,
+        'torque',
+        -self.hold_force,
+        self.hold_force,
+        float('nan'),
+        float('nan'),
+        0.0,
+        0.0,
+    ),
+]
+        
+          
+        self.timeline = []
+        acc = 0.0
+        for dur, mode, lf, rf, lv, rv, s1, s2 in self.sequence:
+            acc += float(dur)
+            self.timeline.append((acc, mode, lf, rf, lv, rv, s1, s2))
+
+        self.get_logger().warn(
+            "jump_node SAFE started: no winch command is sent until /alpine/jump is called"
+        )
+        self.get_logger().info(
+            f"settings: up_force={self.up_force}, hold_force={self.hold_force}, "
+            f"rewind_velocity={self.rewind_velocity}, settle_velocity={self.settle_velocity}"
+        )
 
     def now_ms(self) -> float:
         return self.get_clock().now().nanoseconds / 1e6
 
-    def publish_all(self, lf: float, rf: float, s1: float, s2: float):
+    @staticmethod
+    def safe_round(x: float, ndigits: int = 3):
+        if isinstance(x, float) and math.isnan(x):
+            return 'nan'
+        return round(float(x), ndigits)
+
+    def set_torque_mode(self):
+        msg = String()
+        msg.data = 'closed_loop_torque'
+        self.pub_left_mode.publish(msg)
+        self.pub_right_mode.publish(msg)
+        self.current_mode = 'torque'
+        self.get_logger().info("Published closed_loop_torque to both winches")
+
+    def set_velocity_mode(self):
+        msg = String()
+        msg.data = 'closed_loop_velocity'
+        self.pub_left_mode.publish(msg)
+        self.pub_right_mode.publish(msg)
+        self.current_mode = 'velocity'
+        self.get_logger().info("Published closed_loop_velocity to both winches")
+
+    def set_idle_mode(self):
+        msg = String()
+        msg.data = 'idle'
+        self.pub_left_mode.publish(msg)
+        self.pub_right_mode.publish(msg)
+        self.current_mode = 'idle'
+        self.get_logger().warn("Published idle to both winches")
+
+    def set_mode(self, mode: str):
+        if mode == self.current_mode:
+            return
+
+        if mode == 'torque':
+            self.set_torque_mode()
+        elif mode == 'velocity':
+            self.set_velocity_mode()
+        elif mode == 'idle':
+            self.set_idle_mode()
+        else:
+            self.get_logger().warn(f"Unknown mode requested: {mode}")
+
+    def publish_all(self, lf, rf, lv, rv, s1, s2):
         self.pub_s1.publish(Float32(data=float(s1)))
         self.pub_s2.publish(Float32(data=float(s2)))
 
-        left = RopeCommand(rope_force=float(lf), rope_velocity=0.0, rope_position=0.0)
-        right = RopeCommand(rope_force=float(rf), rope_velocity=0.0, rope_position=0.0)
+        left = RopeCommand()
+        left.header.stamp = self.get_clock().now().to_msg()
+        left.rope_force = float(lf)
+        left.rope_velocity = float(lv)
+        left.rope_position = float('nan')
+
+        right = RopeCommand()
+        right.header.stamp = self.get_clock().now().to_msg()
+        right.rope_force = float(rf)
+        right.rope_velocity = float(rv)
+        right.rope_position = float('nan')
+
         self.pub_left.publish(left)
         self.pub_right.publish(right)
 
-    def send_if_changed(self, lf: float, rf: float, s1: float, s2: float):
-        cmd = (round(lf, 3), round(rf, 3), round(s1, 3), round(s2, 3))
+    def send_if_changed(self, mode, lf, rf, lv, rv, s1, s2):
+        cmd = (
+            mode,
+            self.safe_round(lf),
+            self.safe_round(rf),
+            self.safe_round(lv),
+            self.safe_round(rv),
+            self.safe_round(s1),
+            self.safe_round(s2),
+        )
+
         if cmd != self.last_sent:
-            self.publish_all(lf, rf, s1, s2)
+            self.set_mode(mode)
+            self.publish_all(lf, rf, lv, rv, s1, s2)
             self.last_sent = cmd
 
-    def refresh_current(self, lf: float, rf: float, s1: float, s2: float):
-        # Periodic refresh of the same command for robustness, but not every tick
-        self.publish_all(lf, rf, s1, s2)
+    def refresh_current(self, lf, rf, lv, rv, s1, s2):
+        self.publish_all(lf, rf, lv, rv, s1, s2)
+
+    def publish_hold_light(self):
+        self.send_if_changed(
+            'torque',
+            -self.hold_force,
+            self.hold_force,
+            float('nan'),
+            float('nan'),
+            0.0,
+            0.0,
+        )
+
+    def publish_zero_force(self):
+        self.send_if_changed(
+            'torque',
+            0.0,
+            0.0,
+            float('nan'),
+            float('nan'),
+            0.0,
+            0.0,
+        )
 
     def tick(self):
+        # SICUREZZA:
+        # Se non è stato chiamato /alpine/jump, non pubblica nulla.
         if not self.sequence_running:
-            # In idle, refresh only every 200 ms so we do not fight manual commands too hard.
-            self.idle_refresh_div += 1
-            if self.idle_refresh_div >= 20:
-                self.idle_refresh_div = 0
-                self.send_if_changed(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
             return
 
         elapsed_ms = self.now_ms() - self.sequence_start_ms
 
         phase_index = None
-        lf, rf, s1, s2 = self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2
+        mode = 'torque'
+        lf = -self.hold_force
+        rf = self.hold_force
+        lv = float('nan')
+        rv = float('nan')
+        s1 = 0.0
+        s2 = 0.0
 
-        for i, (limit_ms, lf_v, rf_v, s1_v, s2_v) in enumerate(self.timeline):
+        for i, (limit_ms, mode_v, lf_v, rf_v, lv_v, rv_v, s1_v, s2_v) in enumerate(self.timeline):
             if elapsed_ms < limit_ms:
                 phase_index = i
-                lf, rf, s1, s2 = lf_v, rf_v, s1_v, s2_v
+                mode = mode_v
+                lf = lf_v
+                rf = rf_v
+                lv = lv_v
+                rv = rv_v
+                s1 = s1_v
+                s2 = s2_v
                 break
 
         if phase_index is None:
             self.sequence_running = False
             self.current_phase_index = -1
             self.phase_refresh_div = 0
-            self.get_logger().info("Jump sequence completed")
-            self.send_if_changed(self.idle_lf, self.idle_rf, self.idle_s1, self.idle_s2)
+            self.last_sent = None
+
+            self.get_logger().info("Jump sequence completed -> light hold")
+            self.publish_hold_light()
             return
 
         if phase_index != self.current_phase_index:
             self.current_phase_index = phase_index
             self.phase_refresh_div = 0
+
             self.get_logger().info(
-                f"Phase {phase_index+1}/{len(self.timeline)} -> "
-                f"lf={lf:.1f}, rf={rf:.1f}, s1={s1:.1f}, s2={s2:.1f}"
+                f"Phase {phase_index + 1}/{len(self.timeline)} -> "
+                f"mode={mode}, lf={lf}, rf={rf}, lv={lv}, rv={rv}, "
+                f"s1={s1:.1f}, s2={s2:.1f}"
             )
-            # Send immediately on phase change
-            self.send_if_changed(lf, rf, s1, s2)
+
+            self.send_if_changed(mode, lf, rf, lv, rv, s1, s2)
             return
 
-        # Refresh current phase command every 30 ms (every 3 ticks at 100 Hz)
         self.phase_refresh_div += 1
         if self.phase_refresh_div >= 3:
             self.phase_refresh_div = 0
-            self.refresh_current(lf, rf, s1, s2)
+            self.refresh_current(lf, rf, lv, rv, s1, s2)
 
     def handle_jump(self, request, response):
         self.sequence_running = True
@@ -689,17 +829,53 @@ class JumpNode(Node):
         self.current_phase_index = -1
         self.phase_refresh_div = 0
         self.last_sent = None
+
+        self.set_torque_mode()
+
         self.get_logger().info("Jump sequence triggered")
+
         response.success = True
         response.message = "Jump sequence started"
+        return response
+
+    def handle_abort(self, request, response):
+        self.sequence_running = False
+        self.current_phase_index = -1
+        self.phase_refresh_div = 0
+        self.last_sent = None
+
+        self.set_torque_mode()
+        self.publish_hold_light()
+
+        self.get_logger().warn("Jump aborted -> light hold torque sent")
+
+        response.success = True
+        response.message = "Jump aborted, light hold sent"
+        return response
+
+    def handle_stop(self, request, response):
+        self.sequence_running = False
+        self.current_phase_index = -1
+        self.phase_refresh_div = 0
+        self.last_sent = None
+
+        self.set_torque_mode()
+        self.publish_zero_force()
+
+        self.get_logger().warn("Jump stopped -> zero force sent")
+
+        response.success = True
+        response.message = "Jump stopped, zero force sent"
         return response
 
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = JumpNode()
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
+
     try:
         executor.spin()
     except KeyboardInterrupt:

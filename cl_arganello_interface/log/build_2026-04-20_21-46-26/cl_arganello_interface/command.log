@@ -1,0 +1,2 @@
+Invoking command in '/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface': /usr/bin/cmake /home/andrea/Climb_ros2/cl_arganello_interface -DCMAKE_INSTALL_PREFIX=/home/andrea/Climb_ros2/cl_arganello_interface/install/cl_arganello_interface
+Invoked command in '/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface' returned '1': /usr/bin/cmake /home/andrea/Climb_ros2/cl_arganello_interface -DCMAKE_INSTALL_PREFIX=/home/andrea/Climb_ros2/cl_arganello_interface/install/cl_arganello_interface

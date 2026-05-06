@@ -1,0 +1,10 @@
+{
+  "package_name": "cl_arganello_interface",
+  "non_idl_tuples": [
+    "/home/andrea/Climb_ros2/cl_arganello_interface:srv/RopeControlMode.srv",
+    "/home/andrea/Climb_ros2/cl_arganello_interface:msg/RopeCommand.msg",
+    "/home/andrea/Climb_ros2/cl_arganello_interface:msg/RopeTelemetry.msg",
+    "/home/andrea/Climb_ros2/cl_arganello_interface:msg/DebugMessage.msg",
+    "/home/andrea/Climb_ros2/cl_arganello_interface:msg/Imus.msg"
+  ]
+}

@@ -1,0 +1,24 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/cl_arganello_interface__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/debug_message__type_support.cpp.o"
+  "CMakeFiles/cl_arganello_interface__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/imus__type_support.cpp.o"
+  "CMakeFiles/cl_arganello_interface__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/rope_command__type_support.cpp.o"
+  "CMakeFiles/cl_arganello_interface__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/rope_telemetry__type_support.cpp.o"
+  "CMakeFiles/cl_arganello_interface__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/cl_arganello_interface/srv/detail/rope_control_mode__type_support.cpp.o"
+  "libcl_arganello_interface__rosidl_typesupport_introspection_cpp.pdb"
+  "libcl_arganello_interface__rosidl_typesupport_introspection_cpp.so"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/debug_message__rosidl_typesupport_introspection_cpp.hpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/debug_message__type_support.cpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/imus__rosidl_typesupport_introspection_cpp.hpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/imus__type_support.cpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/rope_command__rosidl_typesupport_introspection_cpp.hpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/rope_command__type_support.cpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/rope_telemetry__rosidl_typesupport_introspection_cpp.hpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/msg/detail/rope_telemetry__type_support.cpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/srv/detail/rope_control_mode__rosidl_typesupport_introspection_cpp.hpp"
+  "rosidl_typesupport_introspection_cpp/cl_arganello_interface/srv/detail/rope_control_mode__type_support.cpp"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/cl_arganello_interface__rosidl_typesupport_introspection_cpp.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

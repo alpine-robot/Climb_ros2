@@ -1,0 +1,15 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from cl_arganello_interface/srv/RopeControlMode.srv
+// generated code does not contain a copyright notice
+
+
+module cl_arganello_interface {
+  module srv {
+    struct RopeControlMode_Request {
+      string message;
+    };
+    struct RopeControlMode_Response {
+      boolean success;
+    };
+  };
+};
