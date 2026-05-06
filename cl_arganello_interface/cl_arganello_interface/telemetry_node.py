@@ -75,9 +75,9 @@ class TelemetryNode(Node):
         # This keeps the external interface compatible with closed_loop_position / rope_position
         # while using the ODrive as inner velocity controller.
         self.declare_parameter("rope_position_outer_loop_enabled", True)
-        self.declare_parameter("rope_position_kp", 1.0)
-        self.declare_parameter("rope_position_max_vel_m_s", 0.01)
-        self.declare_parameter("rope_position_deadband_m", 0.0005)
+        self.declare_parameter("rope_position_kp", 25.0)
+        self.declare_parameter("rope_position_max_vel_m_s", 0.25)
+        self.declare_parameter("rope_position_deadband_m", 0.001)
 
         # Limits & filters
         self.declare_parameter("max_motor_rps", 20.0)
