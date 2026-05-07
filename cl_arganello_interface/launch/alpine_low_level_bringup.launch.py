@@ -16,12 +16,20 @@ def generate_launch_description():
         'config_path': config_path,
         'debug_mode': True,
         'rope_position_outer_loop_enabled': True,
-        'rope_position_kp': 8.0,
-        'rope_position_max_vel_m_s': 0.05,
-        'rope_position_deadband_m': 0.0005,
+        'rope_position_kp': 6.0,
+        'rope_position_max_vel_m_s': 0.10,
+        'rope_position_deadband_m': 0.0015,
         # Convenzione richiesta:
         # rope_position negativo => tira su / riavvolge, sia left sia right.
         'rope_direction_sign': 1.0,
+
+        # Profilo di posizione: zona near SOLO negli ultimi millimetri.
+        'rope_position_motor_vel_scale': 0.75,
+        'rope_position_up_near_vel_m_s': 0.008,
+        'rope_position_up_far_vel_m_s': 0.040,
+        'rope_position_down_near_vel_m_s': 0.110,
+        'rope_position_down_far_vel_m_s': 0.180,
+        'rope_position_profile_zone_m': 0.004,
     }
 
     return LaunchDescription([

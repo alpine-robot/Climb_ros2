@@ -75,9 +75,17 @@ class TelemetryNode(Node):
         # This keeps the external interface compatible with closed_loop_position / rope_position
         # while using the ODrive as inner velocity controller.
         self.declare_parameter("rope_position_outer_loop_enabled", True)
-        self.declare_parameter("rope_position_kp", 25.0)
-        self.declare_parameter("rope_position_max_vel_m_s", 0.25)
-        self.declare_parameter("rope_position_deadband_m", 0.001)
+        self.declare_parameter("rope_position_kp", 6.0)
+        self.declare_parameter("rope_position_max_vel_m_s", 0.10)
+        self.declare_parameter("rope_position_deadband_m", 0.0015)
+        # Outer-loop scaling/profile. Keep G physical; tune only these.
+        self.declare_parameter("rope_direction_sign", 1.0)
+        self.declare_parameter("rope_position_motor_vel_scale", 0.75)
+        self.declare_parameter("rope_position_up_near_vel_m_s", 0.008)
+        self.declare_parameter("rope_position_up_far_vel_m_s", 0.040)
+        self.declare_parameter("rope_position_down_near_vel_m_s", 0.110)
+        self.declare_parameter("rope_position_down_far_vel_m_s", 0.180)
+        self.declare_parameter("rope_position_profile_zone_m", 0.004)
 
         # Limits & filters
         self.declare_parameter("max_motor_rps", 20.0)
@@ -89,8 +97,8 @@ class TelemetryNode(Node):
         self.declare_parameter("phys_max_rope_m_s", 5.0)
 
         # Variable gear ratio estimator
-        self.declare_parameter("gear_ratio_nominal", 2.31)
-        self.declare_parameter("gear_ratio_update_enabled", True)
+        self.declare_parameter("gear_ratio_nominal", 2.31) #2,31
+        self.declare_parameter("gear_ratio_update_enabled", False)
         self.declare_parameter("gear_ratio_min", 0.5)
         self.declare_parameter("gear_ratio_max", 6.0)
         self.declare_parameter("gear_ratio_alpha", 0.02)
@@ -133,6 +141,13 @@ class TelemetryNode(Node):
         self.rope_position_deadband_m = float(
             self.get_parameter("rope_position_deadband_m").value
         )
+        self.rope_direction_sign = float(self.get_parameter("rope_direction_sign").value)
+        self.rope_position_motor_vel_scale = float(self.get_parameter("rope_position_motor_vel_scale").value)
+        self.rope_position_up_near_vel_m_s = float(self.get_parameter("rope_position_up_near_vel_m_s").value)
+        self.rope_position_up_far_vel_m_s = float(self.get_parameter("rope_position_up_far_vel_m_s").value)
+        self.rope_position_down_near_vel_m_s = float(self.get_parameter("rope_position_down_near_vel_m_s").value)
+        self.rope_position_down_far_vel_m_s = float(self.get_parameter("rope_position_down_far_vel_m_s").value)
+        self.rope_position_profile_zone_m = float(self.get_parameter("rope_position_profile_zone_m").value)
 
         self.max_motor_rps = float(self.get_parameter("max_motor_rps").value)
         self.max_roller_rps = float(self.get_parameter("max_roller_rps").value)
@@ -442,28 +457,62 @@ class TelemetryNode(Node):
     def _rope_position_outer_loop_cb(self):
         if not getattr(self, "rope_position_outer_loop_enabled", False):
             return
-
         if getattr(self, "active_rope_control_mode", "idle") != "closed_loop_position":
             return
-
         if self.rope_position_ref_m is None:
             return
-
         if bool(getattr(self, "brake_status", False)):
-            # Do not fight the brake.
             return
+
+        try:
+            self.rope_position_kp = float(self.get_parameter("rope_position_kp").value)
+            self.rope_position_max_vel_m_s = float(self.get_parameter("rope_position_max_vel_m_s").value)
+            self.rope_position_deadband_m = float(self.get_parameter("rope_position_deadband_m").value)
+            self.rope_direction_sign = float(self.get_parameter("rope_direction_sign").value)
+            self.rope_position_motor_vel_scale = float(self.get_parameter("rope_position_motor_vel_scale").value)
+            self.rope_position_up_near_vel_m_s = float(self.get_parameter("rope_position_up_near_vel_m_s").value)
+            self.rope_position_up_far_vel_m_s = float(self.get_parameter("rope_position_up_far_vel_m_s").value)
+            self.rope_position_down_near_vel_m_s = float(self.get_parameter("rope_position_down_near_vel_m_s").value)
+            self.rope_position_down_far_vel_m_s = float(self.get_parameter("rope_position_down_far_vel_m_s").value)
+            self.rope_position_profile_zone_m = float(self.get_parameter("rope_position_profile_zone_m").value)
+        except Exception as e:
+            self.get_logger().warn(f"Could not refresh rope position params: {e}")
 
         actual = float(getattr(self, "rope_length_m", 0.0))
         ref = float(self.rope_position_ref_m)
         error = ref - actual
+        abs_err = abs(error)
 
-        if abs(error) < float(self.rope_position_deadband_m):
-            vel_cmd_m_s = 0.0
-        else:
-            vel_cmd_m_s = float(self.rope_position_kp) * error
-
+        deadband = abs(float(self.rope_position_deadband_m))
         vmax = abs(float(self.rope_position_max_vel_m_s))
-        vel_cmd_m_s = max(-vmax, min(vmax, vel_cmd_m_s))
+        zone = abs(float(self.rope_position_profile_zone_m))
+
+        if abs_err <= deadband:
+            vel_cmd_m_s = 0.0
+            local_vmax = 0.0
+            phase = "stop"
+        else:
+            # Near zone piccola: gli ultimi millimetri. Prima era 5 cm e per uno step da
+            # 2 cm il controllo andava sempre in velocità lenta, accumulando ritardo e overshoot.
+            if error > 0.0:
+                near = abs(float(self.rope_position_up_near_vel_m_s))
+                far = abs(float(self.rope_position_up_far_vel_m_s))
+                phase = "up_near" if abs_err <= zone else "up_far"
+            else:
+                near = abs(float(self.rope_position_down_near_vel_m_s))
+                far = abs(float(self.rope_position_down_far_vel_m_s))
+                phase = "down_near" if abs_err <= zone else "down_far"
+
+            local_vmax = min(vmax, near if abs_err <= zone else far)
+
+            vel_cmd_m_s = float(self.rope_position_kp) * error
+            vel_cmd_m_s = max(-local_vmax, min(local_vmax, vel_cmd_m_s))
+
+            # Safety di segno: se ref < actual, v_cmd deve essere negativo.
+            if error > 0.0:
+                vel_cmd_m_s = abs(vel_cmd_m_s)
+            elif error < 0.0:
+                vel_cmd_m_s = -abs(vel_cmd_m_s)
 
         r0 = float(self.sync_roller_radius_m)
         d = float(self.rope_diameter_m)
@@ -477,6 +526,8 @@ class TelemetryNode(Node):
         motor_vel_turns_s = (
             vel_cmd_m_s / max(r_eff, 1e-9)
         ) / (two_pi * max(G, 1e-9))
+        motor_vel_turns_s *= float(self.rope_direction_sign)
+        motor_vel_turns_s *= float(self.rope_position_motor_vel_scale)
 
         self.send_cmd(f"send_odrive w axis0.controller.input_vel {motor_vel_turns_s:.6f}")
 
@@ -485,7 +536,10 @@ class TelemetryNode(Node):
             self._last_position_loop_log_time = now
             self.get_logger().info(
                 f"[rope_pos_loop] ref={ref:.4f} m, actual={actual:.4f} m, "
-                f"err={error:.4f} m, v_cmd={vel_cmd_m_s:.4f} m/s, "
+                f"err={error:.4f} m, kp={self.rope_position_kp:.2f}, "
+                f"vmax={vmax:.3f}, zone={zone:.4f}, phase={phase}, "
+                f"local_vmax={local_vmax:.3f}, scale={self.rope_position_motor_vel_scale:.2f}, "
+                f"sign={self.rope_direction_sign:+.0f}, v_cmd={vel_cmd_m_s:.4f} m/s, "
                 f"motor_vel={motor_vel_turns_s:.5f} turn/s"
             )
 

@@ -21,10 +21,10 @@ class PositionStepTest(Node):
         super().__init__("position_step_test")
 
         self.declare_parameter("side", "left")
-        self.declare_parameter("step_m", -0.02)          # parti piccolo: 2 cm
+        self.declare_parameter("step_m", 0.30)          # test default: 30 cm
         self.declare_parameter("hold_0_s", 2.0)
-        self.declare_parameter("hold_step_s", 6.0)
-        self.declare_parameter("hold_back_s", 4.0)
+        self.declare_parameter("hold_step_s", 18.0)
+        self.declare_parameter("hold_back_s", 18.0)
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("do_rope_zero", True)
         self.declare_parameter("disengage_brake", True)
