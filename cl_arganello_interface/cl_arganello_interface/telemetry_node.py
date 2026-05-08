@@ -79,7 +79,7 @@ class TelemetryNode(Node):
         self.declare_parameter("rope_position_max_vel_m_s", 0.10)
         self.declare_parameter("rope_position_deadband_m", 0.0015)
         # Outer-loop scaling/profile. Keep G physical; tune only these.
-        self.declare_parameter("rope_direction_sign", 1.0)
+        self.declare_parameter("rope_direction_sign", -1.0)
         self.declare_parameter("rope_position_motor_vel_scale", 0.75)
         self.declare_parameter("rope_position_up_near_vel_m_s", 0.008)
         self.declare_parameter("rope_position_up_far_vel_m_s", 0.040)
@@ -142,6 +142,8 @@ class TelemetryNode(Node):
             self.get_parameter("rope_position_deadband_m").value
         )
         self.rope_direction_sign = float(self.get_parameter("rope_direction_sign").value)
+        self.torque_dir_right = -1.0
+        self.torque_dir_left = 1.0
         self.rope_position_motor_vel_scale = float(self.get_parameter("rope_position_motor_vel_scale").value)
         self.rope_position_up_near_vel_m_s = float(self.get_parameter("rope_position_up_near_vel_m_s").value)
         self.rope_position_up_far_vel_m_s = float(self.get_parameter("rope_position_up_far_vel_m_s").value)
@@ -390,9 +392,20 @@ class TelemetryNode(Node):
             self.get_logger().warn(f"Gear ratio invalid; using fallback G={G:.3f}")
 
         # Torque command:
-        # tau_motor = F_rope * G * r_eff
+        # tau_motor = F_rope * G * r_eff * torque_dir
+        if self.side == "right":
+            torque_dir = self.torque_dir_right
+        else:
+            torque_dir = self.torque_dir_left
+
         if math.isfinite(msg.rope_force):
-            tau_motor = float(msg.rope_force) * G * r_eff
+            tau_motor = float(msg.rope_force) * G * r_eff * torque_dir
+
+            self.get_logger().info(
+                f"[torque_dir] side={self.side}, torque_dir={torque_dir:+.1f}, "
+                f"F_rope={float(msg.rope_force):.3f} N, tau_motor={tau_motor:.6f} N·m"
+            )
+
             self.send_cmd(f"send_odrive w axis0.controller.input_torque {tau_motor:.6f}")
         else:
             tau_motor = float("nan")

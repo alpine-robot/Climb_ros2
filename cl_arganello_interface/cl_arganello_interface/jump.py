@@ -625,7 +625,7 @@ class JumpNode(Node):
         400,
         'torque',
         -18.0,
-        18.0,
+        -18.0,
         float('nan'),
         float('nan'),
         0.0,
@@ -748,7 +748,7 @@ class JumpNode(Node):
         self.send_if_changed(
             'torque',
             -self.hold_force,
-            self.hold_force,
+            -self.hold_force,
             float('nan'),
             float('nan'),
             0.0,
@@ -777,7 +777,7 @@ class JumpNode(Node):
         phase_index = None
         mode = 'torque'
         lf = -self.hold_force
-        rf = self.hold_force
+        rf = -self.hold_force
         lv = float('nan')
         rv = float('nan')
         s1 = 0.0

@@ -22,7 +22,7 @@ def generate_launch_description():
     # 2) your homing node
     homing_node = Node(
         package="cl_arganello_interface",
-        executable="homing_procedure",
+        executable="homing_procedure.py",
         name="homing_procedure",
         output="screen",
         parameters=[{"step_delay": 1.0}],

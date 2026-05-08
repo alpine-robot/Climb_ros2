@@ -34,6 +34,7 @@ install(
     cl_arganello_interface/alpine_odometry_node.py
     cl_arganello_interface/position_step_test.py
     cl_arganello_interface/position_control_logger.py
+    cl_arganello_interface/homing_procedure.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
