@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="task_period" default="0.001" />
+  <xacro:arg name="robot_name" default="climbingrobot" />
+
+  <!-- ROS 2 / Gazebo Classic control plugin. Requires gazebo_ros2_control. -->
+  <gazebo>
+    <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
+      <ros>
+        <namespace>/$(arg robot_name)</namespace>
+      </ros>
+      <!-- Add a controllers.yaml here if you use ros2_control controllers:
+      <parameters>$(find-pkg-share climbingrobot_description)/config/controllers.yaml</parameters>
+      -->
+    </plugin>
+  </gazebo>
+</robot>
