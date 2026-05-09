@@ -1,5 +1,0 @@
-/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface/rosidl_adapter/cl_arganello_interface:srv/RopeControlMode.idl
-/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface/rosidl_adapter/cl_arganello_interface:msg/RopeCommand.idl
-/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface/rosidl_adapter/cl_arganello_interface:msg/RopeTelemetry.idl
-/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface/rosidl_adapter/cl_arganello_interface:msg/DebugMessage.idl
-/home/andrea/Climb_ros2/cl_arganello_interface/build/cl_arganello_interface/rosidl_adapter/cl_arganello_interface:msg/Imus.idl
