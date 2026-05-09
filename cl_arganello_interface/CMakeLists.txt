@@ -44,6 +44,14 @@ install(
   DESTINATION share/${PROJECT_NAME}/
 )
 
+# ─── Install Config Files ────────────────────────────────
+install(
+  DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+
+
 # ─── Required for Interface Export ───────────────────────
 ament_export_dependencies(
   rosidl_default_runtime

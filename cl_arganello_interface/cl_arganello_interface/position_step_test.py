@@ -178,8 +178,8 @@ class PositionStepTest(Node):
         err = [s["error_m"] for s in self.samples]
 
         plt.figure()
-        plt.plot(t, ref, label="reference rope_position [m]", linewidth=2)
-        plt.plot(t, act, label="actual rope_length [m]", linewidth=2)
+        plt.plot(t, ref, label="reference rope_position [m]", linewidth=2, color="tab:orange")
+        plt.plot(t, act, label="actual rope_length [m]", linewidth=2, color="tab:blue")
         plt.xlabel("time [s]")
         plt.ylabel("rope length [m]")
         plt.title(f"Winch {self.side} position control step")
